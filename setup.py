@@ -3,13 +3,13 @@ from setuptools import find_packages, setup
 
 with open("README.md") as f:
 	setup(
-			name = "NoSQLMap",
+			name = "NoSQLMap-ng",
 			version = "0.8",
 			packages = find_packages(),
 
 			entry_points = {
 				"console_scripts": [
-					"nosqlmap = nosqlmap.cli:cli"
+					"nosqlmap-ng = nosqlmap.cli:cli"
 					]
 				},
 
