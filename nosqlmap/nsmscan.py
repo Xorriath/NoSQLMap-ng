@@ -3,10 +3,10 @@
 # See the file 'doc/COPYING' for copying permission
 
 
-from exception import NoSQLMapException
+from .exception import NoSQLMapException
 import ipaddress
-import nsmmongo
-import nsmcouch
+from . import nsmmongo
+from . import nsmcouch
 
 def args():
     return []

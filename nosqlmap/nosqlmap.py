@@ -3,12 +3,12 @@
 # NoSQLMap Copyright 2012-2017 NoSQLMap Development team
 # See the file 'doc/COPYING' for copying permission
 
-from exception import NoSQLMapException
+from .exception import NoSQLMapException
 import sys
-import nsmcouch
-import nsmmongo
-import nsmscan
-import nsmweb
+from . import nsmcouch
+from . import nsmmongo
+from . import nsmscan
+from . import nsmweb
 import os
 import signal
 import ast
@@ -532,7 +532,3 @@ def signal_handler(signal, frame):
     print("CTRL+C detected.  Exiting.")
     sys.exit()
 
-if __name__ == '__main__':
-    parser = build_parser()
-    args = parser.parse_args()
-    main(args)

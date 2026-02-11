@@ -3,12 +3,12 @@
 # See the file 'doc/COPYING' for copying permission
 
 
-from exception import NoSQLMapException
+from .exception import NoSQLMapException
 import urllib.request
 import urllib.parse
 import urllib.error
 import string
-import nsmmongo
+from . import nsmmongo
 import datetime
 import time
 import random

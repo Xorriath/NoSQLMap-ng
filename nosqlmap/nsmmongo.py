@@ -2,7 +2,7 @@
 # NoSQLMap Copyright 2012-2017 NoSQLMap Development team
 # See the file 'doc/COPYING' for copying permission
 
-from exception import NoSQLMapException
+from .exception import NoSQLMapException
 import pymongo
 import urllib.request
 import json
