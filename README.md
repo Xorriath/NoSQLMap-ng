@@ -1,105 +1,89 @@
-# NoSQLMap
+# NoSQLMap-ng
 
-[![Python 2.6|2.7](https://img.shields.io/badge/python-2.6|2.7-yellow.svg)](https://www.python.org/)
-[![License](https://img.shields.io/badge/license-GPLv3-red.svg)](https://github.com/codingo/NoSQLMap/blob/master/COPYING)
-[![Twitter](https://img.shields.io/badge/twitter-@codingo__-blue.svg)](https://twitter.com/codingo_)
+[![Python 3.6+](https://img.shields.io/badge/python-3.6+-yellow.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-GPLv3-red.svg)](https://github.com/Xorriath/NoSQLMap-ng/blob/master/COPYING)
 
-NoSQLMap is an open source Python tool designed to audit for as well as automate injection attacks and exploit default configuration weaknesses in NoSQL databases and web applications using NoSQL in order to disclose or clone data from the database.
+NoSQLMap-ng is a Python 3 fork of [NoSQLMap](https://github.com/codingo/NoSQLMap), an open source tool designed to audit for and automate injection attacks against NoSQL databases and web applications using NoSQL, in order to disclose or clone data from the database.
 
-Originally authored by [@tcsstool](https://twitter.com/tcstoolHax0r) and now maintained by [@codingo\_](https://twitter.com/codingo_) NoSQLMap is named as a tribute to Bernardo Damele and Miroslav's Stampar's popular SQL injection tool [sqlmap](http://sqlmap.org). Its concepts are based on and extensions of Ming Chow's excellent presentation at Defcon 21, ["Abusing NoSQL Databases"](https://www.defcon.org/images/defcon-21/dc-21-presentations/Chow/DEFCON-21-Chow-Abusing-NoSQL-Databases.pdf).
-
-## NoSQLMap MongoDB Management Attack Demo.
-
-<a href="http://www.youtube.com/watch?feature=player_embedded&v=xSFi-jxOBwM" target="_blank"><img src="http://img.youtube.com/vi/xSFi-jxOBwM/0.jpg" alt="NoSQLMap MongoDB Management Attack Demo" width="240" height="180" border="10" /></a>
-
-## Screenshots
-
-![NoSQLMap](https://github.com/codingo/NoSQLMap/blob/master/screenshots/NoSQLMap-v0-5.jpg)
-
-# Summary
-
-## What is NoSQL?
-
-A NoSQL (originally referring to "non SQL", "non relational" or "not only SQL") database provides a mechanism for storage and retrieval of data which is modeled in means other than the tabular relations used in relational databases. Such databases have existed since the late 1960s, but did not obtain the "NoSQL" moniker until a surge of popularity in the early twenty-first century, triggered by the needs of Web 2.0 companies such as Facebook, Google, and Amazon.com. NoSQL databases are increasingly used in big data and real-time web applications. NoSQL systems are also sometimes called "Not only SQL" to emphasize that they may support SQL-like query languages.
+Originally authored by [@tcsstool](https://twitter.com/tcstoolHax0r), maintained by [@codingo\_](https://twitter.com/codingo_), and ported to Python 3 as NoSQLMap-ng. Named as a tribute to [sqlmap](http://sqlmap.org). Its concepts are based on Ming Chow's presentation at Defcon 21, ["Abusing NoSQL Databases"](https://www.defcon.org/images/defcon-21/dc-21-presentations/Chow/DEFCON-21-Chow-Abusing-NoSQL-Databases.pdf).
 
 ## DBMS Support
 
-Presently the tool's exploits are focused around MongoDB, and CouchDB but additional support for other NoSQL based platforms such as Redis, and Cassandra are planned in future releases.
+Presently the tool's exploits are focused around MongoDB and CouchDB, but additional support for other NoSQL platforms such as Redis and Cassandra are planned in future releases.
 
-## Requirements
-
-On a Debian or Red Hat based system, the setup.sh script may be run as root to automate the installation of NoSQLMap's dependencies.
-
-Varies based on features used:
-
--   Metasploit Framework,
--   Python with PyMongo,
--   httplib2,
--   and urllib available.
--   A local, default MongoDB instance for cloning databases to. Check [here](http://docs.mongodb.org/manual/installation/) for installation instructions.
-
-There are some various other libraries required that a normal Python installation should have readily available. Your milage may vary, check the script.
-
-## Setup
+## Installation
 
 ```
-python setup.py install
+pipx install git+https://github.com/Xorriath/NoSQLMap-ng.git
 ```
 
-Alternatively you can build a Docker image by changing to the docker directory and entering:
+Or from a local clone:
 
 ```
-docker build -t nosqlmap .
+git clone https://github.com/Xorriath/NoSQLMap-ng.git
+pipx install ./NoSQLMap-ng
 ```
 
-or you can use Docker-compose to run Nosqlmap:
+## Usage
+
+### CLI Mode
 
 ```
-docker-compose build
-docker-compose run nosqlmap
+nosqlmap-ng --attack 2 --victim <target> --webPort <port> --uri <path> \
+  --httpMethod POST --postData "param1,value1,param2,value2" \
+  --injectedParameter <num> --injectSize <size>
 ```
 
-## Usage Instructions
+### CLI Options
 
-Start with
+| Option | Description |
+|---|---|
+| `--attack` | Attack type: `1` = DB access attacks, `2` = Web app attacks, `3` = Scan for anonymous access |
+| `--platform` | Target platform: `MongoDB` (default) or `CouchDB` |
+| `--victim` | Target host/IP |
+| `--webPort` | Web application port |
+| `--uri` | URI path (e.g. `/index.php`) |
+| `--httpMethod` | `GET` or `POST` (default: `GET`) |
+| `--https` | `ON` or `OFF` (default: `OFF`) |
+| `--postData` | POST parameters as comma-separated list: `name1,val1,name2,val2` |
+| `--requestHeaders` | Custom headers as comma-separated list: `name1,val1,name2,val2` |
+| `--injectedParameter` | Index of the parameter to inject (1-based, follows order given in `--postData`) |
+| `--injectSize` | Size of random baseline string for injection testing |
+| `--verb` | Verbose mode: `ON` or `OFF` (default: `OFF`) |
+| `--dbPort` | Target database port (for direct DB attacks) |
+| `--myIP` | Local IP for DB cloning / reverse shells |
+| `--myPort` | Local port for shell listener |
+
+### Example
+
+Test a POST login form for NoSQL injection:
 
 ```
-python NoSQLMap
+nosqlmap-ng --attack 2 --victim 192.168.1.100 --webPort 80 --uri /login.php \
+  --httpMethod POST --postData "email,admin@example.com,password,test123" \
+  --injectedParameter 2 --injectSize 4
 ```
 
-NoSQLMap uses a menu based system for building attacks. Upon starting NoSQLMap you are presented with with the main menu:
+### Interactive Mode
 
-```
-1-Set options (do this first)
-2-NoSQL DB Access Attacks
-3-NoSQL Web App attacks
-4-Scan for Anonymous MongoDB Access
-x-Exit
-```
-
-Explanation of options:
-
-```
-1. Set target host/IP-The target web server (i.e. www.google.com) or MongoDB server you want to attack.
-2. Set web app port-TCP port for the web application if a web application is the target.
-3. Set URI Path-The portion of the URI containing the page name and any parameters but NOT the host name (e.g. /app/acct.php?acctid=102).
-4. Set HTTP Request Method (GET/POST)-Set the request method to a GET or POST; Presently only GET is implemented but working on implementing POST requests exported from Burp.
-5. Set my local Mongo/Shell IP-Set this option if attacking a MongoDB instance directly to the IP of a target Mongo installation to clone victim databases to or open Meterpreter shells to.
-6. Set shell listener port-If opening Meterpreter shells, specify the port.
-7. Load options file-Load a previously saved set of settings for 1-6.
-8. Load options from saved Burp request-Parse a request saved from Burp Suite and populate the web application options.
-9. Save options file-Save settings 1-6 for future use.
-x. Back to main menu-Use this once the options are set to start your attacks.
-```
-
-Once options are set head back to the main menu and select DB access attacks or web app attacks as appropriate for whether you are attacking a NoSQL management port or web application. The rest of the tool is "wizard" based and fairly self explanatory, but send emails to codingo@protonmail.com or find me on Twitter [@codingo\_](https://twitter.com/codingo_) if you have any questions or suggestions.
+Run `nosqlmap-ng` without arguments to use the interactive menu.
 
 ## Vulnerable Applications
 
-This repo also includes an intentionally vulnerable web application to test NoSQLMap with. To run this application, you need Docker installed. Then you can run the following commands from the /vuln_apps directory.
+This repo includes an intentionally vulnerable web application for testing. Requires Docker:
 
 ```
+cd vuln_apps
 docker-compose build && docker-compose up
 ```
 
-Once that is complete, you should be able to access the vulnerable application by visiting: https://127.0.0.1/index.html
+Then visit: http://127.0.0.1/index.html
+
+## Requirements
+
+- Python >= 3.6
+- pymongo >= 4.0
+- requests >= 2.28
+- CouchDB >= 1.2
+- httplib2 >= 0.20
+- A local MongoDB instance (for DB cloning features)
