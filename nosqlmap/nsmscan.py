@@ -42,7 +42,7 @@ def massScan(platform, args = None):
                 for ip in ipaddress.ip_network(subnet, strict=False):
                     ipList.append(str(ip))
                 optCheck = False
-            except NoSQLMapException:
+            except ValueError:
                 input("Not a valid subnet.  Press enter to return to main menu.")
                 return
 
@@ -55,7 +55,7 @@ def massScan(platform, args = None):
                             ipList = f.readlines()
                     loadCheck = True
                     optCheck = False
-                except NoSQLMapException:
+                except OSError:
                     print("Couldn't open file.")
 
         if loadOpt == "3":
@@ -120,7 +120,7 @@ def massScan(platform, args = None):
                 print("Scan results saved!")
                 select = False
 
-            except NoSQLMapException:
+            except OSError:
                 print("Couldn't save scan results.")
 
         elif saveEm in no_tag:
@@ -138,6 +138,10 @@ def massScan(platform, args = None):
         print(str(outCounter) + "-" + server + " " + versions[outCounter - 1])
         outCounter += 1
 
+    if not success:
+        input("No open " + platform + " servers found.  Press enter to return to the main menu.")
+        return None
+
     select = True
     print("\n")
     while select:
@@ -146,12 +150,11 @@ def massScan(platform, args = None):
         if select == "x" or select == "X":
             return None
 
-        elif select.isdigit() == True and int(select) <= outCounter:
+        elif select.isdigit() and 1 <= int(select) <= len(success):
             victim = success[int(select) - 1]
-            resultSet[0] = True
-            resultSet[1] = victim
             input("New target set! Press enter to return to the main menu.")
-            return resultSet
+            # [optionSet[0]=True flag, chosen victim] consumed by the main menu.
+            return [True, victim]
 
         else:
             input("Invalid selection.")
