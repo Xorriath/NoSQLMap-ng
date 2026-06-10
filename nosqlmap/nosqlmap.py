@@ -199,7 +199,9 @@ def attack(args):
                 return
             t = nsmwebng.parse_raw_request(text, force_ssl=(https == "ON"))
             nsmwebng.run(t["base_url"], t["method"], t["fields"], t["headers"], False, args,
-                         cookies=t["cookies"], inject_fields=t["inject_fields"], vectors=t["vectors"])
+                         cookies=t["cookies"], inject_fields=t["inject_fields"], vectors=t["vectors"],
+                         param_fields=t.get("param_fields"), json_template=t.get("json_template"),
+                         json_segmap=t.get("json_segmap"))
         else:
             base_url, fields = _modern_target(victim, webPort, uri, https, httpMethod, postData)
             # A bare '*' in a --postData value pins the injection point too.
