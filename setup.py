@@ -15,6 +15,8 @@ setup(
     name="NoSQLMap-ng",
     version="0.8",
     packages=find_packages(),
+    package_data={"nosqlmap": ["data/*.json"]},
+    include_package_data=True,
 
     entry_points={
         "console_scripts": [

