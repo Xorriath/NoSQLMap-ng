@@ -275,6 +275,20 @@ def _classify_true(probe, true_sig, false_sig):
 # Detection candidates
 # ---------------------------------------------------------------------------
 
+_ERROR_HINTS = ("missing", "exception", "traceback", "stack trace", "bad request",
+                "not allowed", "invalid request", "internal server error",
+                "<b>error</b>", "typeerror", "valueerror", "keyerror", "undefined index")
+
+
+def _looks_like_error(p, noise):
+    # An operator payload that yields a short, error-shaped response is the
+    # backend REJECTING the array (e.g. "Missing parameter"), not a bypass.
+    if p.status >= 400:
+        return True
+    low = p.body.lower()
+    return any(h in low for h in _ERROR_HINTS) and p.length < noise.len_mean * 0.6
+
+
 def _op_specs():
     # (label, {op: value}) -- every payload is ALWAYS-TRUE (matches any document).
     return [
@@ -370,7 +384,7 @@ def detect(base_url, method, fields_literal, headers=None, verify=False,
             findings.append({
                 "vector": vector, "label": label, "spec": spec, "reasons": reasons2,
                 "strong": positive and positive2, "status": t.status,
-                "length": t.length, "where": meta,
+                "length": t.length, "where": meta, "error": _looks_like_error(t2, noise),
             })
 
     # Time-based blind $where: run when forced, or (auto) when no genuine $where
@@ -1048,10 +1062,12 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None)
                       time_based=time_based, delay_ms=delay_ms)
 
     print("")
-    strong = [f for f in findings if f["strong"]]
+    strong_all = [f for f in findings if f["strong"]]
+    strong = [f for f in strong_all if not f.get("error")]   # genuine injections
+    errors = [f for f in strong_all if f.get("error")]       # array rejected / error responses
     weak = [f for f in findings if not f["strong"]]
 
-    if not strong and not weak:
+    if not strong_all and not weak:
         print("No NoSQL injection detected.")
     else:
         if strong:
@@ -1071,12 +1087,21 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None)
                 print("\n[!] ALL-FIELDS operator injection: on a login this authenticates with")
                 print("    no credentials; on a search/data endpoint it returns every document.")
                 print("    Reproduce: %s" % _payload_repr(ab[0]["spec"], method, ab[0]["vector"]))
-            if any(f["label"].startswith("$where") for f in strong):
+            if any(f["label"].startswith("$where") and not (isinstance(f.get("where"), dict) and f["where"].get("time")) for f in strong):
                 print("\n[!] $where JAVASCRIPT injection confirmed: arbitrary fields are")
                 print("    extractable via this.<field> (even fields the form never submits).")
             if any(isinstance(f.get("where"), dict) and f["where"].get("time") for f in strong):
                 print("\n[!] TIME-BASED blind: no content signal, the oracle is response delay.")
                 print("    Extraction works the same way but is slower (tune with --timeDelay).")
+
+        if errors:
+            ex = errors[0]
+            print("\n=== OPERATOR INJECTION RETURNS AN ERROR (surface, not a bypass) ===")
+            print("[*] %d operator payload(s) produced an error-shaped response (e.g. %s)."
+                  % (len(errors), _payload_repr(ex["spec"], method, ex["vector"])))
+            print("    The backend parses the array into an object and errors ('Missing")
+            print("    parameter'/exception): an injection SURFACE, not a working bypass.")
+            print("    This is the classic cue to try $where/SSJI (incl. time-based).")
 
         if weak:
             print("\n=== POSSIBLE (status-only change, may be a WAF) ===")
