@@ -200,14 +200,48 @@ class Ctx:
         self.proxies = proxies    # {"http":.., "https":..} or None (e.g. route via Burp)
         self.retries = retries    # transient-failure retries with backoff
         self.cookies = cookies    # dict of cookies sent on every request
+        self.dynamic = []         # (prefix,suffix) markings of per-request-varying regions
+
+
+_DYN_LEN = 32
+
+
+def _find_dynamic(a, b):
+    # Two responses to identical-shape requests differ only in per-request
+    # dynamic regions (CSRF tokens, timestamps, counters, reflected input).
+    # Anchor each differing region with (prefix, suffix) drawn from the STATIC
+    # markup around it.  Only matching runs >= _DYN_LEN count as anchors, so
+    # short coincidental matches inside a random token don't fragment it into
+    # bogus markings (sqlmap's DYNAMICITY_BOUNDARY_LENGTH idea).
+    kept = [bl for bl in difflib.SequenceMatcher(None, a, b).get_matching_blocks()
+            if bl.size >= _DYN_LEN]
+    markings = []
+    for i in range(len(kept) - 1):
+        cur, nxt = kept[i], kept[i + 1]
+        end = cur.a + cur.size
+        if nxt.a - end <= 0:
+            continue
+        prefix = a[end - _DYN_LEN:end]
+        suffix = a[nxt.a:nxt.a + _DYN_LEN]
+        if prefix and suffix:
+            markings.append((prefix, suffix))
+    return markings
+
+
+def _apply_dynamic(body, markings):
+    if not markings:
+        return body
+    for prefix, suffix in markings:
+        body = re.sub(re.escape(prefix) + ".*?" + re.escape(suffix), prefix + suffix, body, flags=re.DOTALL)
+    return body
 
 
 class Probe:
-    def __init__(self, resp, elapsed):
+    def __init__(self, resp, elapsed, dynamic=None):
         self.status = resp.status_code
         self.location = resp.headers.get("Location", "")
         self.cookies = resp.headers.get("Set-Cookie", "")
-        self.body = resp.text or ""
+        self.body = _apply_dynamic(resp.text or "", dynamic)
         self.length = len(self.body)
         self.elapsed = elapsed
 
@@ -334,7 +368,7 @@ def _send(ctx, method, url, vector, fields):
         try:
             start = time.time()                  # timed only on the attempt that succeeds,
             resp = ctx.session.request(method, url, **kw)   # so backoff never pollutes timing
-            return Probe(resp, time.time() - start)
+            return Probe(resp, time.time() - start, ctx.dynamic)
         except requests.RequestException as e:
             last = e
             if attempt < ctx.retries:
@@ -496,6 +530,20 @@ def _where_candidates(fields_literal, inject_fields=None):
     return cands
 
 
+def _calibrate_dynamic(ctx, method, base_url, vector, fields_literal):
+    # Learn per-request dynamic regions from two baseline responses (ctx.dynamic
+    # is empty here, so the bodies are raw), then strip them on every later probe.
+    try:
+        a = _send(ctx, method, base_url, vector, {n: ("lit", _rand()) for n in fields_literal})
+        b = _send(ctx, method, base_url, vector, {n: ("lit", _rand()) for n in fields_literal})
+    except requests.RequestException:
+        return
+    markings = _find_dynamic(a.body, b.body)
+    if markings:
+        ctx.dynamic = markings
+        print("  [oracle] auto-stripping %d dynamic region(s) (tokens/timestamps/reflected input)." % len(markings))
+
+
 def detect(base_url, method, fields_literal, headers=None, verify=False,
            csrf=None, no_where=False, ctx=None, time_based="auto", delay_ms=1000,
            inject_fields=None, vectors=None):
@@ -504,6 +552,8 @@ def detect(base_url, method, fields_literal, headers=None, verify=False,
         ctx = Ctx(headers, verify, csrf)
     if vectors is None:
         vectors = ["form"] if method == "GET" else ["form", "json"]
+    if not ctx.dynamic:
+        _calibrate_dynamic(ctx, method, base_url, vectors[0], fields_literal)
     findings = []
 
     for vector in vectors:
