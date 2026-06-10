@@ -191,8 +191,22 @@ def attack(args):
             optionSet[0] = True
             victim = scanResult[1]
     elif args.attack == 4:
-        base_url, fields = _modern_target(victim, webPort, uri, https, httpMethod, postData)
-        nsmwebng.run(base_url, httpMethod, fields, requestHeaders, False, args)
+        if getattr(args, "request", None):
+            try:
+                text = sys.stdin.read() if args.request == "-" else open(args.request).read()
+            except OSError as e:
+                print("Couldn't read request file: " + str(e))
+                return
+            t = nsmwebng.parse_raw_request(text, force_ssl=(https == "ON"))
+            nsmwebng.run(t["base_url"], t["method"], t["fields"], t["headers"], False, args,
+                         cookies=t["cookies"], inject_fields=t["inject_fields"], vectors=t["vectors"])
+        else:
+            base_url, fields = _modern_target(victim, webPort, uri, https, httpMethod, postData)
+            # A bare '*' in a --postData value pins the injection point too.
+            inj = [k for k, v in fields.items() if isinstance(v, str) and "*" in v]
+            fields = {k: (v.replace("*", "") if isinstance(v, str) else v) for k, v in fields.items()}
+            nsmwebng.run(base_url, httpMethod, fields, requestHeaders, False, args,
+                         inject_fields=inj or None)
 
 def platSel():
     global platform
@@ -537,6 +551,7 @@ def build_parser():
     parser.add_argument("--verb", help="Toggle Verbose Mode", choices=["ON", "OFF"], default="OFF")
     parser.add_argument("--postData", help="Enter POST data in a comma separated list (i.e. param name 1,value1,param name 2,value2)", default="")
     parser.add_argument("--requestHeaders", help="Request headers in a comma separated list (i.e. param name 1,value1,param name 2,value2)", default="")
+    parser.add_argument("-r", "--request", help="(attack 4) Load the HTTP request from a file (raw request / Burp 'copy to file'); '-' reads stdin. Mark the injection point with '*' anywhere in the body/query, else all params are tested.")
 
     modules = [nsmcouch, nsmmongo, nsmscan, nsmweb, nsmwebng]
     for module in modules:
