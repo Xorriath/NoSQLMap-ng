@@ -11,7 +11,7 @@ from . import nsmscan
 from . import nsmweb
 import os
 import signal
-import ast
+import json
 
 import argparse
 
@@ -123,19 +123,20 @@ def mainMenu():
             input("Invalid selection.  Press enter to continue.")
 
 def build_request_headers(reqHeadersIn):
-    requestHeaders = {}
     reqHeadersArray = reqHeadersIn.split(",")
+    if len(reqHeadersArray) % 2 != 0 and any(reqHeadersArray):
+        print("Warning: odd number of header fields; the last value will be dropped.")
     headerNames = reqHeadersArray[0::2]
     headerValues = reqHeadersArray[1::2]
-    requestHeaders = dict(zip(headerNames, headerValues))
-    return requestHeaders
+    return dict(zip(headerNames, headerValues))
 
 def build_post_data(postDataIn):
     pdArray = postDataIn.split(",")
+    if len(pdArray) % 2 != 0 and any(pdArray):
+        print("Warning: odd number of POST fields; the last value will be dropped.")
     paramNames = pdArray[0::2]
     paramValues = pdArray[1::2]
-    postData = dict(zip(paramNames,paramValues))
-    return postData
+    return dict(zip(paramNames,paramValues))
 
 def attack(args):
     platform = args.platform
@@ -252,42 +253,38 @@ def options():
         if select == "1":
             # Unset the boolean if it's set since we're setting it again.
             optionSet[0] = False
-            ipLen = False
 
             while optionSet[0] == False:
-                goodDigits = True
-                notDNS = True
                 victim = input("Enter the host IP/DNS name: ")
-                # make sure we got a valid IP
+
+                if not victim.strip():
+                    print("Host cannot be empty.")
+                    continue
+
                 octets = victim.split(".")
 
-                if len(octets) != 4:
-                    # Treat this as a DNS name
-                    optionSet[0] = True
-                    notDNS = False
+                # Four numeric octets -> validate ranges.  Anything else
+                # (including a 4-label FQDN like app.staging.corp.com) is treated
+                # as a DNS name.  The old code caught an exception INSTANCE here,
+                # which raised TypeError and crashed on any non-numeric host.
+                if len(octets) == 4 and all(o.isdigit() for o in octets):
+                    if all(0 <= int(o) <= 255 for o in octets):
+                        print("\nTarget set to " + victim + "\n")
+                        optionSet[0] = True
+                    else:
+                        print("Bad octet in IP address.")
                 else:
-                    # If len(octets) != 4 is executed the block of code below is also run, but it is not necessary
-                    # If the format of the IP is good, check and make sure the octets are all within acceptable ranges.
-                    for item in octets:
-                        try:
-                            if int(item) < 0 or int(item) > 255:
-                                print("Bad octet in IP address.")
-                                goodDigits = False
-
-                        except NoSQLMapException("[!] Must be a DNS name."):
-                            #Must be a DNS name (for now)
-
-                            notDNS = False
-
-                #If everything checks out set the IP and break the loop
-                if goodDigits == True or notDNS == False:
                     print("\nTarget set to " + victim + "\n")
                     optionSet[0] = True
 
         elif select == "2":
-            webPort = input("Enter the HTTP port for web apps: ")
-            print("\nHTTP port set to " + webPort + "\n")
-            optionSet[1] = True
+            p = input("Enter the HTTP port for web apps: ").strip()
+            if p.isdigit() and 1 <= int(p) <= 65535:
+                webPort = int(p)
+                print("\nHTTP port set to " + str(webPort) + "\n")
+                optionSet[1] = True
+            else:
+                print("Invalid port.  Must be 1-65535.")
 
         elif select == "3":
             uri = input("Enter URI Path (Press enter for no URI): ")
@@ -315,9 +312,13 @@ def options():
 
 
         elif select == "5":
-            dbPort = int(input("Enter target MongoDB port: "))
-            print("\nTarget Mongo Port set to " + str(dbPort) + "\n")
-            optionSet[7] = True
+            p = input("Enter target " + platform + " port: ").strip()
+            if p.isdigit() and 1 <= int(p) <= 65535:
+                dbPort = int(p)
+                print("\nTarget " + platform + " Port set to " + str(dbPort) + "\n")
+                optionSet[7] = True
+            else:
+                print("Invalid port.  Must be 1-65535.")
 
         elif select == "6":
             httpMethod = True
@@ -348,39 +349,17 @@ def options():
             optionSet[4] = False
 
             while optionSet[4] == False:
-                goodLen = False
-                goodDigits = True
-                # Every time when user input Invalid IP, goodLen and goodDigits should be reset. If this is not done, there will be a bug
-                # For example enter 10.0.0.1234 first and the goodLen will be set to True and goodDigits will be set to False
-                # Second step enter 10.0.123, because goodLen has already been set to True, this invalid IP will be put in myIP variables
-                myIP = input("Enter the host IP for my " + platform +"/Shells: ")
-                # make sure we got a valid IP
+                myIP = input("Enter the host IP for my " + platform + "/Shells: ")
                 octets = myIP.split(".")
-                # If there aren't 4 octets, toss an error.
-                if len(octets) != 4:
-                    print("Invalid IP length.")
 
-                else:
-                    goodLen = True
-
-                if goodLen == True:
-                # If the format of the IP is good, check and make sure the octets are all within acceptable ranges.
-                    for item in octets:
-                        if int(item) < 0 or int(item) > 255:
-                            print("Bad octet in IP address.")
-                            goodDigits = False
-
-                        # else:
-                        # goodDigits = True
-
-                        # Default value of goodDigits should be set to True
-                        # for example 12.12345.12.12
-
-
-                # If everything checks out set the IP and break the loop
-                if goodLen == True and goodDigits == True:
+                # The listener IP must be a real dotted IPv4; int() on a
+                # non-numeric octet used to raise an uncaught ValueError.
+                if (len(octets) == 4 and all(o.isdigit() for o in octets)
+                        and all(0 <= int(o) <= 255 for o in octets)):
                     print("\nShell/DB listener set to " + myIP + "\n")
                     optionSet[4] = True
+                else:
+                    print("Invalid IP address.")
 
         elif select == "8":
             myPort = input("Enter TCP listener for shells: ")
@@ -400,41 +379,40 @@ def options():
 
         elif select == "0":
             loadPath = input("Enter file name to load: ")
-            csvOpt = []
             try:
-                with open(loadPath,"r") as fo:
-                    for line in fo:
-                        csvOpt.append(line.rstrip())
-            except IOError as e:
-                print("I/O error({0}): {1}".format(e.errno, e.strerror))
+                with open(loadPath, "r") as fo:
+                    opts = json.load(fo)
+            except OSError as e:
+                print("I/O error: " + str(e))
                 input("error reading file.  Press enter to continue...")
                 return
+            except (ValueError, json.JSONDecodeError):
+                input("Invalid or corrupt options file.  Press enter to continue...")
+                return
 
-            optList = csvOpt[0].split(",")
-            victim = optList[0]
-            webPort = optList[1]
-            uri = optList[2]
-            httpMethod = optList[3]
-            myIP = optList[4]
-            myPort = optList[5]
-            verb = optList[6]
-            https = optList[7]
+            victim = opts.get("victim", "Not Set")
+            webPort = opts.get("webPort", 80)
+            uri = opts.get("uri", "Not Set")
+            httpMethod = opts.get("httpMethod", "GET")
+            myIP = opts.get("myIP", "Not Set")
+            myPort = opts.get("myPort", "Not Set")
+            verb = opts.get("verb", "OFF")
+            https = opts.get("https", "OFF")
+            dbPort = opts.get("dbPort", dbPort)
+            postData = opts.get("postData", {}) or {}
+            requestHeaders = opts.get("requestHeaders", {}) or {}
 
-            # saved headers position will depend of the request verb
-            headersPos= 1
-
-            if httpMethod == "POST":
-                postData = ast.literal_eval(csvOpt[1])
-                headersPos = 2
-
-            requestHeaders = ast.literal_eval(csvOpt[headersPos])
-
-            # Set option checking array based on what was loaded
-            x = 0
-            for item in optList:
-                if item != "Not Set":
-                    optionSet[x] = True
-                x += 1
+            # Set the option-checking flags explicitly (the old positional loop
+            # was mis-aligned with the optionSet indices).
+            optionSet[0] = victim != "Not Set"
+            optionSet[1] = True
+            optionSet[2] = uri != "Not Set"
+            optionSet[3] = True
+            optionSet[4] = myIP != "Not Set"
+            optionSet[5] = myPort != "Not Set"
+            optionSet[6] = True
+            optionSet[7] = True
+            optionSet[8] = True
 
         elif select == "a":
             loadPath = input("Enter path to Burp request file: ")
@@ -442,58 +420,73 @@ def options():
             try:
                 with open(loadPath,"r") as fo:
                     for line in fo:
-                        reqData.append(line.rstrip())
-            except IOError as e:
-                print("I/O error({0}): {1}".format(e.errno, e.strerror))
+                        reqData.append(line.rstrip("\r\n"))
+            except OSError as e:
+                print("I/O error: " + str(e))
                 input("error reading file.  Press enter to continue...")
                 return
 
+            if not reqData:
+                input("Empty request file.  Press enter to continue...")
+                return
+
             methodPath = reqData[0].split(" ")
+            if len(methodPath) < 2 or methodPath[0] not in ("GET", "POST"):
+                input("Unsupported or malformed request line.  Press enter to continue...")
+                return
 
-            if methodPath[0] == "GET":
-                httpMethod = "GET"
-
-            elif methodPath[0] == "POST":
-                paramNames = []
-                paramValues = []
-                httpMethod = "POST"
-                postData = reqData[len(reqData)-1]
-                # split the POST parameters up into individual items
-                paramsNvalues = postData.split("&")
-
-                for item in paramsNvalues:
-                    tempList = item.split("=")
-                    paramNames.append(tempList[0])
-                    paramValues.append(tempList[1])
-
-                postData = dict(zip(paramNames,paramValues))
-
-            else:
-                print("unsupported method in request header.")
-
-            # load the HTTP headers
-            for line in reqData[1:]:
-                print(line)
-                if not line.strip(): break
-                header = line.split(": ");
-                requestHeaders[header[0]] = header[1].strip()
-
-            victim = reqData[1].split( " ")[1]
-            optionSet[0] = True
+            httpMethod = methodPath[0]
             uri = methodPath[1]
             optionSet[2] = True
+            optionSet[3] = True
+
+            # Parse headers up to the blank line that separates them from the body.
+            requestHeaders = {}
+            bodyStart = len(reqData)
+            for i in range(1, len(reqData)):
+                if not reqData[i].strip():
+                    bodyStart = i + 1
+                    break
+                parts = reqData[i].split(": ", 1)
+                if len(parts) == 2:
+                    requestHeaders[parts[0]] = parts[1].strip()
+
+            # Target host comes from the Host header (strip any :port), not from a
+            # fixed line number.
+            victim = requestHeaders.get("Host", "").split(":")[0]
+            if victim:
+                optionSet[0] = True
+
+            if httpMethod == "POST":
+                bodyLines = [l for l in reqData[bodyStart:] if l.strip()]
+                body = bodyLines[-1] if bodyLines else ""
+                postData = {}
+                for item in body.split("&"):
+                    if not item:
+                        continue
+                    kv = item.split("=", 1)
+                    postData[kv[0]] = kv[1] if len(kv) > 1 else ""
 
         elif select == "b":
             savePath = input("Enter file name to save: ")
+            opts = {
+                "victim": victim,
+                "webPort": webPort,
+                "uri": uri,
+                "httpMethod": httpMethod,
+                "myIP": myIP,
+                "myPort": myPort,
+                "verb": verb,
+                "https": https,
+                "dbPort": dbPort,
+                "postData": globals().get("postData", {}) if httpMethod == "POST" else {},
+                "requestHeaders": requestHeaders,
+            }
             try:
                 with open(savePath, "w") as fo:
-                    fo.write(str(victim) + "," + str(webPort) + "," + str(uri) + "," + str(httpMethod) + "," + str(myIP) + "," + str(myPort) + "," + verb + "," + https)
-
-                    if httpMethod == "POST":
-                        fo.write(",\n"+ str(postData))
-                    fo.write(",\n" + str(requestHeaders) )
-                    print("Options file saved!")
-            except IOError:
+                    json.dump(opts, fo, indent=2)
+                print("Options file saved!")
+            except OSError:
                 print("Couldn't save options file.")
 
         elif select == "h":
