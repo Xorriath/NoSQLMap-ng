@@ -100,6 +100,21 @@ def _parse_proxy(spec):
     return {"http": spec, "https": spec}
 
 
+def _flatten_json(obj, path=""):
+    # Nested JSON -> {dotted-path: leaf}; every leaf is a candidate injection
+    # point (operator bypasses live at arbitrary depth in real Mongo APIs).
+    items = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            items.update(_flatten_json(v, (path + "." if path else "") + str(k)))
+    elif isinstance(obj, list):
+        for idx, v in enumerate(obj):
+            items.update(_flatten_json(v, (path + "." if path else "") + str(idx)))
+    else:
+        items[path or "_"] = obj
+    return items
+
+
 def parse_raw_request(text, force_ssl=False):
     # Parse a raw HTTP request (Burp 'Copy to file' / repeater paste) into a
     # target dict the engine can drive, preserving the real headers/cookies/
@@ -152,11 +167,7 @@ def parse_raw_request(text, force_ssl=False):
             obj = _json.loads(body)
         except ValueError:
             obj = {}
-        fields = {}
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                sval = v if isinstance(v, str) else _json.dumps(v)
-                fields[k] = _mark(k, sval)
+        fields = {path: _mark(path, leaf) for path, leaf in _flatten_json(obj).items()}
         vector = "json"
     elif body:
         fields = {k: _mark(k, v) for k, v in urllib.parse.parse_qsl(body, keep_blank_values=True)}
@@ -250,16 +261,52 @@ def _build_form(fields):
     return out
 
 
-def _build_json(fields):
-    out = {}
-    for name, spec in fields.items():
-        if spec[0] == "lit":
-            out[name] = spec[1]
-        elif spec[0] == "op":
-            out[name] = {spec[1]: spec[2]}
+def _render_spec(spec):
+    if spec[0] == "lit":
+        return spec[1]
+    if spec[0] == "op":
+        return {spec[1]: spec[2]}
+    return dict(spec[1])          # ("ops", {...}) nested dicts/lists/bools pass through
+
+
+def _container_set(cur, k, v):
+    if isinstance(cur, list):
+        i = int(k)
+        while len(cur) <= i:
+            cur.append(None)
+        cur[i] = v
+    else:
+        cur[k] = v
+
+
+def _container_get(cur, k):
+    if isinstance(cur, list):
+        i = int(k)
+        return cur[i] if 0 <= i < len(cur) else None
+    return cur.get(k)
+
+
+def _json_set(root, keys, value):
+    cur = root
+    for i, k in enumerate(keys):
+        if i == len(keys) - 1:
+            _container_set(cur, k, value)
         else:
-            out[name] = dict(spec[1])
-    return out
+            child = _container_get(cur, k)
+            if child is None:
+                child = [] if keys[i + 1].lstrip("-").isdigit() else {}
+                _container_set(cur, k, child)
+            cur = child
+
+
+def _build_json(fields):
+    # Un-flatten dotted paths ("filter.user", "items.0.name") back into the
+    # nested structure, placing each field's rendered payload at its path.  A
+    # flat (dot-free) field name just becomes a top-level key.
+    root = {}
+    for name, spec in fields.items():
+        _json_set(root, name.split("."), _render_spec(spec))
+    return root
 
 
 def _send(ctx, method, url, vector, fields):
