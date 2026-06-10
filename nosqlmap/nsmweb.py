@@ -359,7 +359,7 @@ def getApps(webPort,victim,uri,https,verb,requestHeaders, args = None):
                 print("HTTP load time variance was only " + str(intTimeDelta) + " seconds.  Injection probably didn't work.")
                 intTbAttack = False
 
-        if lt24 == True:
+        if lt24 == True and args == None:
             bfInfo = input("MongoDB < 2.4 detected.  Start brute forcing database info (y/n)? ")
 
             if bfInfo.lower() == "y":
