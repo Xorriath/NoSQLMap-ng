@@ -554,6 +554,7 @@ def build_parser():
     parser.add_argument("--postData", help="Enter POST data in a comma separated list (i.e. param name 1,value1,param name 2,value2)", default="")
     parser.add_argument("--requestHeaders", help="Request headers in a comma separated list (i.e. param name 1,value1,param name 2,value2)", default="")
     parser.add_argument("-r", "--request", help="(attack 4) Load the HTTP request from a file (raw request / Burp 'copy to file'); '-' reads stdin. Mark the injection point with '*' anywhere in the body/query, else all params are tested.")
+    parser.add_argument("--batch", action="store_true", help="(attack 4) Never prompt; assume non-interactive defaults for every question.")
 
     modules = [nsmcouch, nsmmongo, nsmscan, nsmweb, nsmwebng]
     for module in modules:

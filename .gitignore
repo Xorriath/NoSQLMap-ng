@@ -223,3 +223,6 @@ pip-log.txt
 *.pyproj
 *.sln
 /.vs/ProjectSettings.json
+
+# nosqlmap-ng modern engine output (findings / extracted data / session db)
+nosqlmap-out/

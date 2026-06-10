@@ -140,6 +140,73 @@ def test_time_detect_rejects_nonpositive_delay():
     assert w._detect_time(w.Ctx(), "POST", "http://x/", {"u": "x"}, ["form"], 0) == []
 
 
+# --- Phase C: length pre-probe -----------------------------------------------
+def _oracle(secret):
+    return lambda pat: re.search(pat, secret) is not None
+
+
+def test_value_length():
+    assert w._value_length(_oracle("hello"), 64) == 5
+    assert w._value_length(_oracle(""), 64) == 0
+    assert w._value_length(_oracle("abc"), 2) == 2          # capped at maxlen
+
+
+# --- Phase C: walk resume (start prefix) + known length + checkpoint ---------
+def test_walk_resume_and_checkpoint():
+    secret = "Secret_42"
+    charset = "".join(sorted(set(secret)))
+    seen = []
+    v = w._walk_value(_oracle(secret), charset, 64, start="Sec",
+                      length=len(secret), on_char=seen.append)
+    assert v == secret
+    assert seen and seen[-1] == secret          # checkpoint fired, last == full value
+    assert all(secret.startswith(s) for s in seen)   # monotonic prefixes
+
+
+# --- Phase C: pin clause keeps record fields on one document -----------------
+def test_pin_js():
+    assert w._pin_js({"username": "alice"}) == ' && String(this.username)==="alice"'
+    assert w._pin_js(None) == ""
+
+
+# --- Phase C: session store roundtrip + resume + flush + no_resume -----------
+def test_store_roundtrip():
+    import tempfile
+    import shutil
+    from nosqlmap import nsmstore
+    d = tempfile.mkdtemp()
+    try:
+        s = nsmstore.Store("http://t/login", output_dir=d)
+        ck = nsmstore.context_key({"field": "u", "pin": [], "exclude": []})
+        assert s.get_value(ck) is None
+        s.set_partial(ck, "u", "ali", False)            # partial
+        assert s.get_value(ck)["complete"] is False
+        s.set_partial(ck, "u", "alice", True, 5)        # complete
+        assert s.get_value(ck) == {"value": "alice", "complete": True, "length": 5}
+        s.close()
+
+        # a no_resume Store ignores the saved value
+        s2 = nsmstore.Store("http://t/login", output_dir=d, no_resume=True)
+        assert s2.get_value(ck) is None
+        s2.close()
+
+        # flush clears it
+        s3 = nsmstore.Store("http://t/login", output_dir=d, flush=True)
+        assert s3.get_value(ck) is None
+        s3.close()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_context_key_stable_and_distinct():
+    from nosqlmap import nsmstore
+    a = nsmstore.context_key({"field": "u", "pin": [("x", "1")], "exclude": ["a"]})
+    b = nsmstore.context_key({"exclude": ["a"], "pin": [("x", "1")], "field": "u"})
+    c = nsmstore.context_key({"field": "u", "pin": [("x", "1")], "exclude": ["a", "b"]})
+    assert a == b          # key order independent
+    assert a != c          # different exclude -> different key
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
