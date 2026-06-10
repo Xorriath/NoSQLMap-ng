@@ -1,2 +1,2 @@
-#!/bin/ash
-python nosqlmap.py
+#!/bin/sh
+exec nosqlmap-ng "$@"

@@ -1,18 +1,10 @@
-FROM python:2.7-alpine
+# The codebase is Python 3.  Build the LOCAL package (not the old upstream repo)
+# on a Python 3 base.  docker-compose sets the build context to the repo root.
+FROM python:3.12-slim
 
-RUN echo 'http://dl-cdn.alpinelinux.org/alpine/v3.9/main' >> /etc/apk/repositories
-RUN echo 'http://dl-cdn.alpinelinux.org/alpine/v3.9/community' >> /etc/apk/repositories
-RUN apk update && apk add mongodb git
+WORKDIR /app
+COPY . /app
 
-RUN git clone https://github.com/codingo/NoSQLMap.git /root/NoSqlMap
+RUN pip install --no-cache-dir .
 
-WORKDIR /root/NoSqlMap
-
-RUN python setup.py install
-
-RUN python -m pip install requests 'certifi<=2020.4.5.1'
-
-COPY entrypoint.sh /tmp/entrypoint.sh
-RUN chmod +x /tmp/entrypoint.sh
-
-ENTRYPOINT ["/tmp/entrypoint.sh"]
+ENTRYPOINT ["nosqlmap-ng"]

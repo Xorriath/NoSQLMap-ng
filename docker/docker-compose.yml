@@ -1,6 +1,10 @@
 version: "3"
 services:
   nosqlmap:
-    image: nosqlmap:latest
+    image: nosqlmap-ng:latest
     build:
-      context: .
+      # Build from the repo root so the local package is installed.
+      context: ..
+      dockerfile: docker/Dockerfile
+    stdin_open: true
+    tty: true
