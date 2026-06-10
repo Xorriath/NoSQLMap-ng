@@ -207,6 +207,77 @@ def test_context_key_stable_and_distinct():
     assert a != c          # different exclude -> different key
 
 
+# --- Phase C review fixes ----------------------------------------------------
+# C1: a stale resumed prefix that no longer matches the live oracle is discarded
+def test_walk_discards_stale_prefix_via_revalidation():
+    secret = "root"
+    charset = "".join(sorted(set(secret + "adm")))
+    # Caller's job (extract.walk) is to discard a stale start when the prefix no
+    # longer matches; emulate that guard and confirm the walk then recovers live.
+    stale = "adm"
+    if not _oracle(secret)("^" + re.escape(stale)):
+        stale = ""
+    assert stale == ""     # "adm" is not a prefix of "root" -> discarded
+    assert w._walk_value(_oracle(secret), charset, 64, start=stale) == secret
+
+
+# C3: typed booleans stringify to JS-canonical lowercase (so pin matching works)
+def test_typed_str_boolean_canonical():
+    assert w._typed_str(True) == "true"
+    assert w._typed_str(False) == "false"
+    assert w._typed_str(42) == "42"
+    assert w._pin_js({"isAdmin": w._typed_str(True)}) == ' && String(this.isAdmin)==="true"'
+
+
+# C2: Ctx.clone gives a fresh Session but copies config + learned dynamic regions
+def test_ctx_clone_independent_session():
+    base = w.Ctx(headers={"X": "1"}, verify=True, cookies={"s": "1"})
+    base.dynamic = [("pre", "suf")]
+    c = base.clone()
+    assert c.session is not base.session          # own Session (thread-safe)
+    assert c.headers == base.headers and c.verify == base.verify
+    assert c.cookies == base.cookies
+    assert c.dynamic == base.dynamic and c.dynamic is not base.dynamic
+
+
+# C5: data.csv is rewritten even when a run recovers no records (no stale rows)
+def test_csv_truncated_on_empty_run():
+    import tempfile
+    import shutil
+    from nosqlmap import nsmstore
+    d = tempfile.mkdtemp()
+    try:
+        s = nsmstore.Store("http://t/x", output_dir=d)
+        s.write_records(["a", "b"], [{"a": "1", "b": "2"}])
+        s.write_records(["a", "b"], [])          # empty run must not keep old rows
+        s.close()
+        rows = open(s.csv_path).read().strip().splitlines()
+        assert rows == ["a,b"], rows               # header only, stale row gone
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# C7: --flushSession clears the streamed output files, not just the sqlite rows
+def test_flush_clears_output_files():
+    import os
+    import tempfile
+    import shutil
+    from nosqlmap import nsmstore
+    d = tempfile.mkdtemp()
+    try:
+        s = nsmstore.Store("http://t/x", output_dir=d)
+        s.record_value("u", "alice")
+        s.save_finding({"label": "L", "vector": "form"}, "u[$ne]=x")
+        s.close()
+        assert os.path.getsize(os.path.join(d, "data.ndjson")) > 0
+        s2 = nsmstore.Store("http://t/x", output_dir=d, flush=True)
+        s2.close()
+        assert not os.path.exists(os.path.join(d, "data.ndjson"))
+        assert not os.path.exists(os.path.join(d, "findings.ndjson"))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

@@ -52,13 +52,13 @@ class Store:
             "  updated REAL, PRIMARY KEY(target, vector, label));"
         )
         self.db.commit()
-        if flush:
-            self.flush()
 
         self.log_path = os.path.join(self.output_dir, "run.log")
         self.findings_path = os.path.join(self.output_dir, "findings.ndjson")
         self.data_path = os.path.join(self.output_dir, "data.ndjson")
         self.csv_path = os.path.join(self.output_dir, "data.csv")
+        if flush:                     # after paths exist, so flush() can clear the data files too
+            self.flush()
         self._logf = open(self.log_path, "a", encoding="utf-8")
         self.log("=== run start: %s ===" % self.target)
 
@@ -114,8 +114,9 @@ class Store:
                 f.write(json.dumps(rec, default=str) + "\n")
 
     def write_records(self, field_list, records):
-        # Tabular dump (one row per record) -> data.csv.
-        if not records:
+        # Tabular dump (one row per record) -> data.csv.  Always (re)write so a
+        # run that recovers nothing cannot leave a previous run's rows behind.
+        if not field_list:
             return
         with self._lock:
             with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
@@ -130,6 +131,13 @@ class Store:
             self.db.execute("DELETE FROM values_ WHERE target=?", (self.target,))
             self.db.execute("DELETE FROM findings WHERE target=?", (self.target,))
             self.db.commit()
+        # Clear the streamed output files too, so --flushSession really resets
+        # this target instead of leaving stale findings/data alongside an empty db.
+        for p in (self.findings_path, self.data_path, self.csv_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
     def close(self):
         try:

