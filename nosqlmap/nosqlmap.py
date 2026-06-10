@@ -9,9 +9,11 @@ from . import nsmcouch
 from . import nsmmongo
 from . import nsmscan
 from . import nsmweb
+from . import nsmwebng
 import os
 import signal
 import json
+import urllib.parse
 
 import argparse
 
@@ -73,6 +75,7 @@ def mainMenu():
         print("3-NoSQL Web App attacks")
         print("4-Scan for Anonymous " + platform + " Access")
         print("5-Change Platform (Current: " + platform + ")")
+        print("6-Modern Web NoSQL Injection / Auth-Bypass")
         print("x-Exit")
 
         select = input("Select an option: ")
@@ -116,6 +119,14 @@ def mainMenu():
         elif select == "5":
             platSel()
 
+        elif select == "6":
+            if (optionSet[0] == True) and (optionSet[2] == True):
+                base_url, fields = _modern_target(victim, webPort, uri, https, httpMethod,
+                                                  globals().get("postData", {}))
+                nsmwebng.run(base_url, httpMethod, fields, requestHeaders, False, None)
+            else:
+                input("Options not set! Check host and URI path.  Press enter to continue...")
+
         elif select == "x":
             sys.exit()
 
@@ -137,6 +148,18 @@ def build_post_data(postDataIn):
     paramNames = pdArray[0::2]
     paramValues = pdArray[1::2]
     return dict(zip(paramNames,paramValues))
+
+def _modern_target(victim, webPort, uri, https, httpMethod, postData):
+    # Build (base_url, fields) for the modern engine from the current options.
+    scheme = "https" if https == "ON" else "http"
+    if httpMethod == "GET":
+        parsed = urllib.parse.urlsplit(str(uri))
+        base_url = scheme + "://" + str(victim) + ":" + str(webPort) + (parsed.path or "/")
+        fields = dict(urllib.parse.parse_qsl(parsed.query))
+    else:
+        base_url = scheme + "://" + str(victim) + ":" + str(webPort) + str(uri)
+        fields = dict(postData) if postData else {}
+    return base_url, fields
 
 def attack(args):
     platform = args.platform
@@ -167,6 +190,9 @@ def attack(args):
         if scanResult != None:
             optionSet[0] = True
             victim = scanResult[1]
+    elif args.attack == 4:
+        base_url, fields = _modern_target(victim, webPort, uri, https, httpMethod, postData)
+        nsmwebng.run(base_url, httpMethod, fields, requestHeaders, False, args)
 
 def platSel():
     global platform
@@ -498,7 +524,7 @@ def options():
 
 def build_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--attack", help="1 = NoSQL DB Access Attacks, 2 = NoSQL Web App attacks, 3 - Scan for Anonymous platform Access", type=int, choices=[1,2,3])
+    parser.add_argument("--attack", help="1 = NoSQL DB Access Attacks, 2 = NoSQL Web App attacks, 3 = Scan for Anonymous platform Access, 4 = Modern web NoSQL injection / auth-bypass (differential oracle)", type=int, choices=[1,2,3,4])
     parser.add_argument("--platform", help="Platform to attack", choices=["MongoDB", "CouchDB"], default="MongoDB")
     parser.add_argument("--victim", help="Set target host/IP (ex: localhost or 127.0.0.1)")
     parser.add_argument("--dbPort", help="Set shell listener port", type=int)
@@ -512,7 +538,7 @@ def build_parser():
     parser.add_argument("--postData", help="Enter POST data in a comma separated list (i.e. param name 1,value1,param name 2,value2)", default="")
     parser.add_argument("--requestHeaders", help="Request headers in a comma separated list (i.e. param name 1,value1,param name 2,value2)", default="")
 
-    modules = [nsmcouch, nsmmongo, nsmscan, nsmweb]
+    modules = [nsmcouch, nsmmongo, nsmscan, nsmweb, nsmwebng]
     for module in modules:
         group = parser.add_argument_group(module.__name__)
         for arg in module.args():
